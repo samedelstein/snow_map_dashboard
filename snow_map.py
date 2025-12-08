@@ -216,6 +216,16 @@ bucket_order = [
     "< 1 hour",
 ]
 
+# Display labels with colored squares that match the map colors
+bucket_display_labels = {
+    "Never plowed (before 12/1)": "⬜ Never plowed (before 12/1)",
+    "> 24 hours": "🟥 > 24 hours",
+    "12–24 hours": "🟥 12–24 hours",
+    "6–12 hours": "🟧 6–12 hours",
+    "1–6 hours": "🟨 1–6 hours",
+    "< 1 hour": "🟩 < 1 hour",
+}
+
 bucket_miles = (
     df.groupby("bucket")["miles"]
     .sum()
@@ -273,25 +283,42 @@ with st.expander("Bucket miles data"):
 
 st.subheader("Map of snow routes by time since last plow")
 
-buckets = bucket_miles_df["bucket"].tolist()
-selected_buckets = st.multiselect(
+# Legend (if you kept the HTML legend, leave it as-is here)
+
+# Build display options for the multiselect
+options = [bucket_display_labels[b] for b in bucket_order]
+default_options = options  # all selected by default
+
+selected_display = st.multiselect(
     "Show buckets:",
-    options=buckets,
-    default=buckets,
+    options=options,
+    default=default_options,
 )
 
+# Map selected display labels back to internal bucket keys
+selected_buckets = [
+    b for b in bucket_order
+    if bucket_display_labels[b] in selected_display
+]
+
+# Start from selected buckets
 map_df = df[df["bucket"].isin(selected_buckets)].copy()
+
+# Safety: drop rows with missing timestamps (should be none after fetch_data)
 map_df = map_df.dropna(subset=["lastserviced_dt"])
+
+# Remove missing or empty paths
 map_df = map_df.dropna(subset=["path"])
 map_df = map_df[map_df["path"].map(lambda p: isinstance(p, list) and len(p) > 0)]
 
+# Colors per bucket (R, G, B) – unchanged
 bucket_colors = {
-    "Never plowed (before 12/1)": [200, 200, 200],
-    "> 24 hours": [128, 0, 38],
-    "12–24 hours": [227, 26, 28],
-    "6–12 hours": [253, 141, 60],
-    "1–6 hours": [255, 237, 111],
-    "< 1 hour": [44, 162, 95],
+    "Never plowed (before 12/1)": [200, 200, 200],  # gray
+    "> 24 hours": [128, 0, 38],                     # dark red
+    "12–24 hours": [227, 26, 28],                   # red
+    "6–12 hours": [253, 141, 60],                   # orange
+    "1–6 hours": [255, 237, 111],                   # yellow
+    "< 1 hour": [44, 162, 95],                      # green-ish
 }
 
 map_df["color"] = map_df["bucket"].map(
