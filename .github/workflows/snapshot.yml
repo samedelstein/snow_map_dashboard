@@ -25,13 +25,30 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests; fi
 
+      - name: Debug - list snapshot folder
+        run: |
+          ls -la snapshot_snow_routes
+
       - name: Run snapshot script
-        run: python snapshot_snow_routes.py
+        run: python snapshot_snow_routes/snapshot_snow_routes.py
+
+      - name: Debug - show output mtimes
+        run: |
+          ls -la snapshot_snow_routes/latest_routes.geojson snapshot_snow_routes/snapshots.csv snapshot_snow_routes/state.json
+          tail -n 2 snapshot_snow_routes/snapshots.csv
+
 
       - name: Commit and push changes
         run: |
+          set -euxo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add latest_routes.geojson snapshots.csv state.json
+
+          git status --porcelain
+          git add snapshot_snow_routes/latest_routes.geojson snapshot_snow_routes/snapshots.csv snapshot_snow_routes/state.json
+          git status --porcelain
+          git diff --cached --name-status
+
           git commit -m "snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || exit 0
           git push
+
