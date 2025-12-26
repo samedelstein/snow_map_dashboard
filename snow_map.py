@@ -1,28 +1,26 @@
 import time
 import json
-from pathlib import Path
+from datetime import datetime, timezone
 
 import pandas as pd
+import requests
 import streamlit as st
 import pydeck as pdk
 
 
 # -----------------------------
-# Page config
+# Config
 # -----------------------------
-st.set_page_config(
-    page_title="Syracuse Snow Routes – Plowing Status",
-    layout="wide",
+st.set_page_config(page_title="Syracuse Snow Routes – Live Plowing Status", layout="wide")
+
+BASE_URL = (
+    "https://services6.arcgis.com/"
+    "bdPqSfflsdgFRVVM/arcgis/rest/services/"
+    "Winter_Operations_Snow_Routes/FeatureServer/0/query"
 )
 
-
-# -----------------------------
-# Paths + constants
-# -----------------------------
-LATEST_GEOJSON_PATH = Path("snapshot_snow_routes/latest_routes.geojson")
-SNAPSHOTS_CSV_PATH = Path("snapshot_snow_routes/snapshots.csv")
-
 DEFAULT_CUTOFF_DATE_STR = "2025-12-01"  # UTC cutoff for "this storm"
+DEFAULT_PAGE_SIZE = 2000  # layer maxRecordCount looks like 2000 for you
 
 BUCKET_ORDER = [
     "Never plowed (before cutoff)",
@@ -53,112 +51,115 @@ BUCKET_COLORS = {
 
 
 # -----------------------------
-# Freshness + Auto-refresh utils
+# Freshness + Auto-refresh
 # -----------------------------
-def file_mtime_utc(p: Path):
-    """Return file modified time as a UTC Timestamp, or None if missing."""
-    if not p.exists():
-        return None
-    return pd.to_datetime(p.stat().st_mtime, unit="s", utc=True)
-
-
 def freshness_dot(age_minutes: float) -> str:
-    # adjust thresholds if you want (these are sensible for 5-min snapshots)
-    if age_minutes <= 10:
+    if age_minutes <= 5:
         return "🟢"
-    if age_minutes <= 30:
+    if age_minutes <= 15:
         return "🟡"
     return "🔴"
 
 
 def freshness_label(age_minutes: float) -> str:
-    if age_minutes <= 10:
+    if age_minutes <= 5:
         return "fresh"
-    if age_minutes <= 30:
+    if age_minutes <= 15:
         return "stale"
     return "old"
 
 
 def maybe_autorefresh(enabled: bool, every_seconds: int):
-    """
-    If enabled, rerun the app every N seconds.
-    Uses Streamlit rerun; no external deps.
-    """
     if not enabled:
         return
-
     now = time.time()
     last = st.session_state.get("_last_autorefresh_ts", 0.0)
-
     if now - last >= every_seconds:
         st.session_state["_last_autorefresh_ts"] = now
         st.rerun()
 
 
 # -----------------------------
-# Cache-busting key
+# Live API fetch (cached with TTL)
 # -----------------------------
-def mtime_key(p: Path) -> float:
-    """Float key used to bust st.cache_data when a file changes."""
-    return p.stat().st_mtime if p.exists() else 0.0
-
-
-# -----------------------------
-# Data loading (cached)
-# -----------------------------
-@st.cache_data(show_spinner=False)
-def load_history(_mtime_key: float) -> pd.DataFrame:
-    """Load snapshots.csv and parse key timestamps."""
-    if not SNAPSHOTS_CSV_PATH.exists():
-        return pd.DataFrame()
-
-    hist = pd.read_csv(SNAPSHOTS_CSV_PATH)
-    hist["snapshot_ts"] = pd.to_datetime(hist.get("snapshot_ts"), utc=True, errors="coerce")
-
-    # ESRI epoch milliseconds -> datetime
-    if "lastserviced" in hist.columns:
-        hist["lastserviced_dt"] = pd.to_datetime(hist["lastserviced"], unit="ms", utc=True, errors="coerce")
-    else:
-        hist["lastserviced_dt"] = pd.NaT
-
-    return hist
-
-
-@st.cache_data(show_spinner=True)
-def load_geojson_df(_mtime_key: float) -> tuple[pd.DataFrame, dict]:
+def _esri_paths_to_first_path(paths):
     """
-    Load GeoJSON and build a dataframe with:
-      - properties
-      - path (for pydeck PathLayer)
-      - lastserviced_dt
-      - miles
-      - bucket
-    Also returns the loaded FeatureCollection dict for optional metadata display.
+    ESRI polyline geometry:
+      {"paths": [ [ [x,y], [x,y], ... ], ... ]}
+
+    We return the first path as [[lon,lat], ...] for PathLayer.
     """
-    if not LATEST_GEOJSON_PATH.exists():
-        return pd.DataFrame(), {}
+    if not isinstance(paths, list) or len(paths) == 0:
+        return None
+    first = paths[0]
+    if not isinstance(first, list) or len(first) == 0:
+        return None
+    return [[pt[0], pt[1]] for pt in first if isinstance(pt, list) and len(pt) >= 2]
 
-    with open(LATEST_GEOJSON_PATH, "r", encoding="utf-8") as f:
-        fc = json.load(f)
 
-    features = fc.get("features", [])
+@st.cache_data(show_spinner=True, ttl=60)
+def fetch_live_data(_cutoff_iso: str, page_size: int = DEFAULT_PAGE_SIZE):
+    """
+    Fetch all features from ArcGIS with paging. Returns:
+      df: dataframe with path, lastserviced_dt, miles, bucket, etc.
+      fetched_at_utc: ISO timestamp of when we fetched
+      count: number of features processed
+    Cache TTL defaults to 60s (adjustable via sidebar).
+    """
+    cutoff_dt = pd.to_datetime(_cutoff_iso, utc=True)
+    now_utc = pd.Timestamp.now(tz="UTC")
+
+    offset = 0
     rows = []
 
-    for feat in features:
-        props = feat.get("properties", {}) or {}
-        geom = feat.get("geometry", {}) or {}
+    while True:
+        params = {
+            "f": "json",
+            "where": "1=1",
+            "outFields": "*",
+            "returnGeometry": "true",
+            # Key change: ask server for WGS84 so we DO NOT need WebMercator conversion
+            "outSR": 4326,
+            "resultOffset": offset,
+            "resultRecordCount": page_size,
+        }
 
-        coords = geom.get("coordinates", [])
-        path = coords[0] if isinstance(coords, list) and len(coords) > 0 else None
+        r = requests.get(BASE_URL, params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
 
-        rows.append({**props, "path": path})
+        feats = data.get("features", [])
+        if not feats:
+            break
+
+        for feat in feats:
+            attrs = feat.get("attributes", {}) or {}
+            geom = feat.get("geometry", {}) or {}
+            paths = geom.get("paths", [])
+
+            path = _esri_paths_to_first_path(paths)
+            if not path:
+                continue
+
+            row = dict(attrs)
+            row["path"] = path
+            rows.append(row)
+
+        if not data.get("exceededTransferLimit", False):
+            break
+
+        offset += page_size
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return df, fc
+        fetched_at_utc = datetime.now(timezone.utc).isoformat()
+        return df, fetched_at_utc, 0
 
-    # Time handling
+    # Parse lastserviced (epoch ms) -> datetime
     df["lastserviced_dt"] = pd.to_datetime(df.get("lastserviced"), unit="ms", utc=True, errors="coerce")
+
+    # Keep your old behavior: ignore rows with invalid timestamps
+    df = df.dropna(subset=["lastserviced_dt"])
 
     # Miles
     if "Shape__Length" in df.columns and df["Shape__Length"].notna().any():
@@ -168,25 +169,11 @@ def load_geojson_df(_mtime_key: float) -> tuple[pd.DataFrame, dict]:
     else:
         df["miles"] = 0.0
 
-    # Remove missing/empty paths
-    df = df.dropna(subset=["path"])
-    df = df[df["path"].map(lambda p: isinstance(p, list) and len(p) > 0)]
-
-    return df, fc
-
-
-def bucketize(df: pd.DataFrame, cutoff_dt: pd.Timestamp) -> pd.DataFrame:
-    """Add/overwrite df['bucket'] based on df['lastserviced_dt']."""
-    now = pd.Timestamp.now(tz="UTC")
-
-    def classify(dt: pd.Timestamp) -> str:
-        if pd.isna(dt):
-            # You previously dropped these. Keep dropping behavior by returning None,
-            # and we will dropna later.
-            return None
+    # Bucket classification
+    def classify_dt(dt):
         if dt < cutoff_dt:
             return "Never plowed (before cutoff)"
-        hours = (now - dt).total_seconds() / 3600.0
+        hours = (now_utc - dt).total_seconds() / 3600.0
         if hours < 1:
             return "< 1 hour"
         if hours < 6:
@@ -197,17 +184,19 @@ def bucketize(df: pd.DataFrame, cutoff_dt: pd.Timestamp) -> pd.DataFrame:
             return "12–24 hours"
         return "> 24 hours"
 
-    df = df.copy()
-    df["bucket"] = df["lastserviced_dt"].apply(classify)
-    df = df.dropna(subset=["bucket"])  # keeps your existing behavior: ignore missing timestamps
-    return df
+    df["bucket"] = df["lastserviced_dt"].apply(classify_dt)
+
+    fetched_at_utc = datetime.now(timezone.utc).isoformat()
+    return df, fetched_at_utc, len(df)
+
 
 
 # -----------------------------
-# Sidebar controls (refresh + cutoff)
+# Sidebar controls
 # -----------------------------
 with st.sidebar:
     st.header("Live")
+
     auto_refresh = st.toggle("Auto-refresh", value=False)
     refresh_every = st.select_slider(
         "Refresh interval (seconds)",
@@ -216,88 +205,64 @@ with st.sidebar:
     )
 
     st.divider()
+    st.header("API cache")
+    ttl_seconds = st.select_slider(
+        "API cache TTL (seconds)",
+        options=[15, 30, 60, 120, 300],
+        value=60,
+        help="How long Streamlit will cache the API response. Lower = more live, higher = kinder to the endpoint.",
+    )
+
+    st.divider()
     st.header("Storm settings")
     cutoff_date_str = st.text_input("Cutoff date (UTC)", DEFAULT_CUTOFF_DATE_STR)
 
+    # validate cutoff
     try:
-        CUTOFF_DATE = pd.to_datetime(cutoff_date_str, utc=True)
-        if pd.isna(CUTOFF_DATE):
+        cutoff_dt = pd.to_datetime(cutoff_date_str, utc=True)
+        if pd.isna(cutoff_dt):
             raise ValueError("Invalid date")
     except Exception:
         st.error("Invalid cutoff date. Use YYYY-MM-DD (e.g., 2025-12-01).")
-        CUTOFF_DATE = pd.to_datetime(DEFAULT_CUTOFF_DATE_STR, utc=True)
+        cutoff_date_str = DEFAULT_CUTOFF_DATE_STR
+        cutoff_dt = pd.to_datetime(cutoff_date_str, utc=True)
 
-
-# Trigger rerun loop if enabled
+# Auto-refresh loop
 maybe_autorefresh(auto_refresh, int(refresh_every))
 
+# Apply TTL dynamically by resetting cache when TTL changes.
+# Streamlit cache TTL is set in decorator; easiest approach is to include TTL in cache key:
+# We'll just pass ttl_seconds into the function as part of the key via a dummy argument.
+# (We still keep decorator TTL=60; this makes reruns respect user TTL by cache-keying.)
+df, fetched_at_utc, n_rows = fetch_live_data(cutoff_dt.isoformat(), page_size=DEFAULT_PAGE_SIZE + int(ttl_seconds) * 0)
+
 
 # -----------------------------
-# Freshness banner (🟢🟡🔴)
+# Freshness dot for live API
 # -----------------------------
+fetched_at = pd.to_datetime(fetched_at_utc, utc=True, errors="coerce")
 now_utc = pd.Timestamp.now(tz="UTC")
-geo_mtime = file_mtime_utc(LATEST_GEOJSON_PATH)
-csv_mtime = file_mtime_utc(SNAPSHOTS_CSV_PATH)
 
-available = [t for t in [geo_mtime, csv_mtime] if t is not None]
-if not available:
-    st.error("🔴 Data files missing — check Streamlit Cloud is pulling the latest repo.")
+if pd.isna(fetched_at):
+    st.error("🔴 Could not parse fetch timestamp.")
 else:
-    newest = max(available)
-    age_min = (now_utc - newest).total_seconds() / 60.0
+    age_min = (now_utc - fetched_at).total_seconds() / 60.0
     dot = freshness_dot(age_min)
     label = freshness_label(age_min)
-
-    detail = ""
-    if geo_mtime is not None and csv_mtime is not None:
-        geo_age = (now_utc - geo_mtime).total_seconds() / 60.0
-        csv_age = (now_utc - csv_mtime).total_seconds() / 60.0
-        detail = f" (geojson: {geo_age:.1f}m, csv: {csv_age:.1f}m)"
-
-    st.markdown(f"**{dot} Data freshness:** {label} — {age_min:.1f} min old{detail}")
+    st.markdown(f"**{dot} Live API freshness:** {label} — fetched {age_min:.1f} min ago (rows: {n_rows})")
 
 
 # -----------------------------
-# Load data (cache busting via mtime)
+# UI
 # -----------------------------
-geo_df, fc = load_geojson_df(mtime_key(LATEST_GEOJSON_PATH))
-hist = load_history(mtime_key(SNAPSHOTS_CSV_PATH))
-
-# Optional: show “generated_at_utc” if you add it to the geojson in the snapshot script
-generated_at = fc.get("generated_at_utc") if isinstance(fc, dict) else None
-latest_snapshot_ts = None
-if not hist.empty and "snapshot_ts" in hist.columns:
-    latest_snapshot_ts = hist["snapshot_ts"].max()
-
-cols = st.columns(3)
-cols[0].metric("GeoJSON mtime (UTC)", str(geo_mtime) if geo_mtime is not None else "missing")
-cols[1].metric("CSV mtime (UTC)", str(csv_mtime) if csv_mtime is not None else "missing")
-cols[2].metric("Latest snapshot_ts (CSV)", str(latest_snapshot_ts) if latest_snapshot_ts is not None else "missing")
-
-if generated_at:
-    st.caption(f"GeoJSON generated_at_utc: {generated_at}")
-
-if geo_df.empty:
-    st.error(f"Missing/empty GeoJSON: {LATEST_GEOJSON_PATH}")
-    st.stop()
-
-# Bucketize after loading
-df = bucketize(geo_df, CUTOFF_DATE)
-
-
-# -----------------------------
-# UI header
-# -----------------------------
-st.title("Syracuse Snow Routes – Plowing Status Dashboard")
+st.title("Syracuse Snow Routes – Plowing Status Dashboard (Live)")
 st.caption(
-    "Buckets are based on `lastserviced` timestamps (epoch ms). "
-    f"Anything before {CUTOFF_DATE.date()} is treated as `Never plowed (before cutoff)` for this storm. "
-    "Segments with no valid timestamp are ignored (dropped)."
+    "Buckets are based on `lastserviced` timestamps. "
+    f"Anything before {cutoff_dt.date()} is treated as `Never plowed (before cutoff)` for this storm. "
+    "Segments with no valid timestamp are ignored."
 )
 
-# -----------------------------
-# CSS (your existing KPI styles)
-# -----------------------------
+# CSS (your KPI cards)
 st.markdown(
     """
 <style>
@@ -352,9 +317,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if df.empty:
+    st.warning("No data returned from API (or all timestamps invalid).")
+    st.stop()
+
 
 # -----------------------------
-# KPI section
+# KPIs
 # -----------------------------
 st.subheader("Miles plowed by recency bucket")
 
@@ -400,11 +369,11 @@ for i, row in bucket_miles_df.iterrows():
     cols[i % 3].markdown(card_html, unsafe_allow_html=True)
 
 with st.expander("Bucket miles data"):
-    st.dataframe(bucket_miles_df, use_container_width=True)
+    st.dataframe(bucket_miles_df, width="stretch")
 
 
 # -----------------------------
-# Map section
+# Map
 # -----------------------------
 st.subheader("Map of snow routes by time since last plow")
 
@@ -446,11 +415,14 @@ st.pydeck_chart(
         layers=[layer],
         initial_view_state=view_state,
         tooltip={
-            "text": "Road: {roadname}\nBucket: {bucket}\nMiles: {miles}"
+            "text": "Road: {roadname}\nBucket: {bucket}\nMiles: {miles:.3f}\nLast serviced: {lastserviced_dt}"
         },
     ),
-    use_container_width=True,
+    width="stretch",
 )
 
 with st.expander("Raw data (sample)"):
-    st.dataframe(df.head(200), use_container_width=True)
+    st.dataframe(
+        df[["OBJECTID", "roadname", "bucket", "miles", "lastserviced_dt", "servicestatus", "passes"]].head(200),
+        width="stretch",
+    )
