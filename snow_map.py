@@ -3,6 +3,9 @@ import requests
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
+import json
+from pathlib import Path
+
 
 BASE_URL = (
     "https://services6.arcgis.com/"
@@ -25,7 +28,101 @@ def web_mercator_to_wgs84(x, y):
 
 
 @st.cache_data(show_spinner=True)
-def fetch_data(page_size=1000):
+LATEST_GEOJSON_PATH = Path("snapshot_snow_routes/latest_routes.geojson")
+SNAPSHOTS_CSV_PATH = Path("snapshot_snow_routes/snapshots.csv")
+
+# “This storm” cutoff – anything before this is considered never plowed for this event
+CUTOFF_DATE = pd.to_datetime("2025-12-01", utc=True)
+@st.cache_data(show_spinner=False)
+def load_history():
+    if not SNAPSHOTS_CSV_PATH.exists():
+        return pd.DataFrame()
+    hist = pd.read_csv(SNAPSHOTS_CSV_PATH)
+    hist["snapshot_ts"] = pd.to_datetime(hist["snapshot_ts"], utc=True, errors="coerce")
+    hist["lastserviced_dt"] = pd.to_datetime(hist["lastserviced"], unit="ms", utc=True, errors="coerce")
+    return hist
+
+@st.cache_data(show_spinner=True)
+def fetch_data_from_latest_geojson():
+    """
+    Load precomputed GeoJSON written by your GitHub Action:
+      - snapshot_snow_routes/latest_routes.geojson
+
+    Build a dataframe with:
+      - lastserviced_dt
+      - miles
+      - bucket
+      - path (for pydeck)
+    """
+    if not LATEST_GEOJSON_PATH.exists():
+        st.error(f"Missing file: {LATEST_GEOJSON_PATH}. "
+                 "Make sure your GitHub Action has run and the file exists.")
+        return pd.DataFrame()
+
+    with open(LATEST_GEOJSON_PATH, "r", encoding="utf-8") as f:
+        fc = json.load(f)
+
+    features = fc.get("features", [])
+    rows = []
+    for feat in features:
+        props = feat.get("properties", {}) or {}
+        geom = feat.get("geometry", {}) or {}
+
+        # We wrote MultiLineString in the snapshot script
+        coords = geom.get("coordinates", [])
+        # For pydeck PathLayer, use first line if present
+        path = coords[0] if isinstance(coords, list) and len(coords) > 0 else None
+
+        rows.append({**props, "path": path})
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        return df
+
+    # --- Time handling ---
+    df["lastserviced_dt"] = pd.to_datetime(
+        df.get("lastserviced"), unit="ms", utc=True, errors="coerce"
+    )
+    df = df.dropna(subset=["lastserviced_dt"])
+
+    # --- Miles ---
+    # Your snapshot CSV includes segmentlength; GeoJSON props may include both.
+    if "Shape__Length" in df.columns:
+        df["miles"] = pd.to_numeric(df["Shape__Length"], errors="coerce") / 1609.344
+    elif "segmentlength" in df.columns:
+        df["miles"] = pd.to_numeric(df["segmentlength"], errors="coerce")
+    else:
+        df["miles"] = 0.0
+
+    # --- Bucket classification ---
+    now = pd.Timestamp.now(tz="UTC")
+
+    def classify_row(dt):
+        if pd.isna(dt):
+            return None
+        if dt < CUTOFF_DATE:
+            return "Never plowed (before 12/1)"
+        hours = (now - dt).total_seconds() / 3600.0
+        if hours < 1:
+            return "< 1 hour"
+        elif hours < 6:
+            return "1–6 hours"
+        elif hours < 12:
+            return "6–12 hours"
+        elif hours < 24:
+            return "12–24 hours"
+        else:
+            return "> 24 hours"
+
+    df["bucket"] = df["lastserviced_dt"].apply(classify_row)
+
+    # Remove missing/empty paths
+    df = df.dropna(subset=["path"])
+    df = df[df["path"].map(lambda p: isinstance(p, list) and len(p) > 0)]
+
+    return df
+
     """
     Fetch all snow route segments with attributes + geometry and
     pre-compute:
@@ -203,7 +300,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-df = fetch_data()
+df = fetch_data_from_latest_geojson()
 
 # --- Miles by bucket (for metrics) ---
 
