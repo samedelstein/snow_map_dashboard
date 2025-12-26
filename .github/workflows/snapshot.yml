@@ -26,12 +26,12 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests; fi
 
       - name: Run snapshot script
-        run: python snapshot_snow_routes.py
+        run: python snapshot_snow_routes/snapshot_snow_routes.py
 
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add latest_routes.geojson snapshots.csv state.json
+          git add snapshot_snow_routes/latest_routes.geojson snapshot_snow_routes/snapshots.csv snapshot_snow_routes/state.json
           git commit -m "snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || exit 0
           git push
