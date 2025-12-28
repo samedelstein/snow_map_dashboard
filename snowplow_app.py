@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 ARTIFACT_DIR = REPO_ROOT / "artifacts_snow"
 PRED_PATH = ARTIFACT_DIR / "predictions_latest_prob.csv"
 METRICS_PATH = ARTIFACT_DIR / "model_metrics_prob.json"
-GEOJSON_PATH = REPO_ROOT / "winter_operations_snow_routes_layer0.geojson"
+GEOJSON_PATH = REPO_ROOT / "snapshot_snow_routes/latest_routes.geojson"  # updated by snapshot_snow_routes/snapshot_snow_routes.py
 SNAPSHOT_PATH = REPO_ROOT / "snapshot_snow_routes" / "snapshots.csv"
 
 DEFAULT_CUTOFF_DATE_STR = "2025-12-01"  # UTC cutoff for "this storm"
