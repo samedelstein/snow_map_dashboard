@@ -59,3 +59,18 @@ observations and alert context for Syracuse, NY.
 
 When the model job runs, it writes `artifacts_snow/weather_data_sources.json` with the
 observed time coverage and row counts for each weather feed.
+
+### NWS alerts log dataset
+
+The alerts collection step appends new alert records to a dedicated dataset at
+`artifacts_snow/nws_alerts_log.csv`. Records are de-duplicated by `alert_id` so the
+file grows incrementally over time.
+
+Schema:
+
+- `alert_id`: NWS alert identifier (de-duplication key).
+- `event`: event name (e.g., Winter Storm Warning).
+- `start_ts`: alert start timestamp (UTC).
+- `end_ts`: alert end timestamp (UTC).
+- `severity`: NWS severity classification.
+- `source_url`: source alert URL from `api.weather.gov/alerts`.
