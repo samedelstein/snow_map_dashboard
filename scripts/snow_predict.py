@@ -18,6 +18,7 @@ import requests
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.inspection import permutation_importance
+import sklearn.metrics as sk_metrics
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -461,29 +462,41 @@ def add_features(
     f = f.merge(route, on=[EVENT, "snowrouteid", "hour_bucket"], how="left")
     f["route_services_last_hour"] = f["route_services_last_hour"].fillna(0)
 
-    def rolling_sum(group: pd.DataFrame, value_col: str, window: int) -> pd.Series:
-        g = group.sort_values("hour_bucket")
-        series = g.set_index("hour_bucket")[value_col]
-        rolled = series.rolling(f"{window}h", min_periods=1).sum()
-        rolled.index = g.index
-        return rolled
+    def rolling_sum_by_group(
+        data: pd.DataFrame, group_cols: list[str], value_col: str, window: int
+    ) -> pd.Series:
+        ordered = data.sort_values(group_cols + ["hour_bucket"]).copy()
+        rolled = (
+            ordered.set_index("hour_bucket")
+            .groupby(group_cols, sort=False)[value_col]
+            .rolling(f"{window}h", min_periods=1)
+            .sum()
+            .reset_index(level=group_cols, drop=True)
+        )
+        rolled.index = ordered.index
+        return rolled.reindex(data.index)
 
-    def rolling_delta_ratio(
-        group: pd.DataFrame, value_col: str, window: int, prefix: str
+    def rolling_delta_ratio_by_group(
+        data: pd.DataFrame, group_cols: list[str], value_col: str, window: int, prefix: str
     ) -> pd.DataFrame:
-        g = group.sort_values("hour_bucket")
-        series = g.set_index("hour_bucket")[value_col]
-        rolling_min = series.rolling(f"{window}h", min_periods=1).min()
-        rolling_max = series.rolling(f"{window}h", min_periods=1).max()
+        ordered = data.sort_values(group_cols + ["hour_bucket"]).copy()
+        series = (
+            ordered.set_index("hour_bucket")
+            .groupby(group_cols, sort=False)[value_col]
+        )
+        rolling_obj = series.rolling(f"{window}h", min_periods=1)
+        rolling_min = rolling_obj.min().reset_index(level=group_cols, drop=True)
+        rolling_max = rolling_obj.max().reset_index(level=group_cols, drop=True)
         delta = (rolling_max - rolling_min).to_numpy()
         ratio = (rolling_max / rolling_min.replace(0, np.nan)).to_numpy()
-        return pd.DataFrame(
+        out = pd.DataFrame(
             {
                 f"{prefix}_delta_{window}h": delta,
                 f"{prefix}_ratio_{window}h": ratio,
             },
-            index=g.index,
+            index=ordered.index,
         )
+        return out.reindex(data.index)
 
     def group_apply_no_groups(df: pd.DataFrame, by: list[str], func, **kwargs):
         grouped = df.groupby(by, group_keys=False)
@@ -493,38 +506,20 @@ def add_features(
             return grouped.apply(func, **kwargs)
 
     for window in [3, 6]:
-        f[f"seg_services_{window}h"] = (
-            group_apply_no_groups(
-                f, [EVENT, SEG], rolling_sum, value_col="lastserviced_changed", window=window
-            ).fillna(0)
-        )
-        f[f"route_services_{window}h"] = (
-            group_apply_no_groups(
-                f,
-                [EVENT, "snowrouteid"],
-                rolling_sum,
-                value_col="lastserviced_changed",
-                window=window,
-            ).fillna(0)
-        )
+        f[f"seg_services_{window}h"] = rolling_sum_by_group(
+            f, [EVENT, SEG], "lastserviced_changed", window
+        ).fillna(0)
+        f[f"route_services_{window}h"] = rolling_sum_by_group(
+            f, [EVENT, "snowrouteid"], "lastserviced_changed", window
+        ).fillna(0)
 
-        seg_roll = group_apply_no_groups(
-            f,
-            [EVENT, SEG],
-            rolling_delta_ratio,
-            value_col="passes_event",
-            window=window,
-            prefix="passes_event",
+        seg_roll = rolling_delta_ratio_by_group(
+            f, [EVENT, SEG], "passes_event", window, "passes_event"
         ).fillna(0)
         f = f.join(seg_roll)
 
-        route_roll = group_apply_no_groups(
-            f,
-            [EVENT, "snowrouteid"],
-            rolling_delta_ratio,
-            value_col="passes_event",
-            window=window,
-            prefix="route_passes_event",
+        route_roll = rolling_delta_ratio_by_group(
+            f, [EVENT, "snowrouteid"], "passes_event", window, "route_passes_event"
         ).fillna(0)
         f = f.join(route_roll)
 
@@ -653,7 +648,10 @@ def train_eta_regression(
     preds = reg.predict(X[test_idx])
     y_true = df.loc[test_idx, "hours_to_next_service"]
     metrics["mae"] = float(mean_absolute_error(y_true, preds))
-    metrics["rmse"] = float(np.sqrt(mean_squared_error(y_true, preds)))
+    if hasattr(sk_metrics, "root_mean_squared_error"):
+        metrics["rmse"] = float(sk_metrics.root_mean_squared_error(y_true, preds))
+    else:
+        metrics["rmse"] = float(np.sqrt(mean_squared_error(y_true, preds)))
 
     prob_df = pd.DataFrame(index=df.loc[test_idx].index)
     for h in HORIZONS:
@@ -668,9 +666,14 @@ def train_eta_regression(
         eta_true = y_true[valid_eta]
         eta_pred = eta_series[valid_eta]
         metrics["eta_class_mae"] = float(mean_absolute_error(eta_true, eta_pred))
-        metrics["eta_class_rmse"] = float(
-            np.sqrt(mean_squared_error(eta_true, eta_pred))
-        )
+        if hasattr(sk_metrics, "root_mean_squared_error"):
+            metrics["eta_class_rmse"] = float(
+                sk_metrics.root_mean_squared_error(eta_true, eta_pred)
+            )
+        else:
+            metrics["eta_class_rmse"] = float(
+                np.sqrt(mean_squared_error(eta_true, eta_pred))
+            )
 
     return reg, metrics
 
