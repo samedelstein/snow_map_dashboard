@@ -1,10 +1,12 @@
 """
 Snowplow probability prediction model (robust, geometry optional).
-Fetches snapshots, engineers features, trains horizon models, and writes predictions.
+Uses local snapshot + GeoJSON files by default, with optional CLI/env overrides
+for remote snapshot training.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from typing import Any
@@ -16,13 +18,14 @@ from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.neighbors import BallTree
 
 # -----------------------------
-# Config
+# Config (defaults to local snapshot/geojson files)
 # -----------------------------
-SNAPSHOT_URL = (
+SNAPSHOT_PATH = "snapshot_snow_routes/snapshots.csv"
+REMOTE_SNAPSHOT_URL = (
     "https://raw.githubusercontent.com/samedelstein/snow_map_dashboard/"
     "refs/heads/main/snapshot_snow_routes/snapshots.csv"
 )
-GEOJSON_PATH = "snapshot_snow_routes/latest_routes.geojson"
+GEOJSON_PATH = "winter_operations_snow_routes_layer0.geojson"
 
 EVENT = "eventid"
 SEG = "snowroutesegmentid"
@@ -37,8 +40,8 @@ os.makedirs(ARTIFACT_DIR, exist_ok=True)
 # -----------------------------
 # Load snapshots
 # -----------------------------
-def load_snapshots(url: str) -> pd.DataFrame:
-    df = pd.read_csv(url)
+def load_snapshots(source: str) -> pd.DataFrame:
+    df = pd.read_csv(source)
     df[TS] = pd.to_datetime(df[TS], utc=True, errors="coerce")
 
     for c in ["lastserviced", "lastserviceleft", "lastserviceright"]:
@@ -352,7 +355,32 @@ def predict_latest(
 
 
 def main() -> None:
-    snapshots = load_snapshots(SNAPSHOT_URL)
+    parser = argparse.ArgumentParser(
+        description="Train snowplow service prediction models from snapshots."
+    )
+    parser.add_argument(
+        "--snapshot-source",
+        default=None,
+        help=(
+            "Optional CSV path/URL override for snapshots. Defaults to the local "
+            f"file ({SNAPSHOT_PATH})."
+        ),
+    )
+    parser.add_argument(
+        "--use-remote",
+        action="store_true",
+        help="Use the remote snapshot URL instead of the local file.",
+    )
+    args = parser.parse_args()
+
+    env_source = os.getenv("SNOW_SNAPSHOT_SOURCE")
+    snapshot_source = (
+        args.snapshot_source
+        or env_source
+        or (REMOTE_SNAPSHOT_URL if args.use_remote else SNAPSHOT_PATH)
+    )
+
+    snapshots = load_snapshots(snapshot_source)
     if snapshots.empty:
         print("No snapshots loaded; exiting without training.")
         return
