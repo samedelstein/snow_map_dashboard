@@ -15,11 +15,14 @@ pip install streamlit pandas requests pydeck
 
 ## Run the Streamlit app
 
-The Streamlit app lives in `snow_map.py`.
+The current Streamlit entrypoint is `snowplow_app.py` (the older `snow_map.py` is optional/legacy).
 
 ```bash
-streamlit run snow_map.py
+streamlit run snowplow_app.py
 ```
+
+If you want to use the Predictions tab, make sure the latest artifacts are available at
+`artifacts_snow/predictions_latest_prob.csv`.
 
 ## Snapshot job
 
