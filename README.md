@@ -13,40 +13,64 @@ source .venv/bin/activate
 pip install streamlit pandas requests pydeck
 ```
 
-## Run the Streamlit app
+## Repository layout
 
-The current Streamlit entrypoint is `snowplow_app.py` (the older `snow_map.py` is optional/legacy).
+- `scripts/`: runnable entrypoints (Streamlit app, prediction pipeline, and snapshot wrapper).
+- `snow_map_dashboard/`: the core Python package (including the snapshot module).
+- `data/`: generated artifacts and snapshot datasets committed by automation.
+
+## Pipelines
+
+### Streamlit app
+
+The current Streamlit entrypoint is `scripts/snowplow_app.py` (the older `scripts/snow_map.py` is
+optional/legacy).
 
 ```bash
-streamlit run snowplow_app.py
+streamlit run scripts/snowplow_app.py
 ```
 
 If you want to use the Predictions tab, make sure the latest artifacts are available at
-`artifacts_snow/predictions_latest_prob.csv`.
+`data/artifacts_snow/predictions_latest_prob.csv`.
 
-## Snapshot job
+### Snapshot job
 
-The snapshot job is implemented in `snapshot_snow_routes/snapshot_snow_routes.py`. It pulls the latest
-snow route data from the ArcGIS feature service, writes a fresh GeoJSON file for the dashboard, and
-records changes over time.
+The snapshot job is implemented in `snow_map_dashboard.snapshot`. It pulls the latest snow route
+data from the ArcGIS feature service, writes a fresh GeoJSON file for the dashboard, and records
+changes over time.
 
 Run it with:
 
 ```bash
-python snapshot_snow_routes/snapshot_snow_routes.py
+python -m snow_map_dashboard.snapshot
 ```
 
-Generated files (all under `snapshot_snow_routes/`):
+Generated files (all under `data/snapshot_snow_routes/`):
 
 - `latest_routes.geojson`: the most recent full GeoJSON snapshot for map rendering.
 - `snapshots.csv`: an append-only history of route attribute changes.
 - `state.json`: a lightweight fingerprint store used to detect which features have changed since the
   last run.
 
+### Prediction pipeline
+
+The prediction pipeline is implemented in `scripts/snow_predict.py` and produces the latest model
+outputs for the dashboard.
+
+```bash
+python scripts/snow_predict.py
+```
+
+Generated files (all under `data/artifacts_snow/`):
+
+- `predictions_latest_prob.csv`: latest per-segment probability predictions.
+- `model_metrics_prob.json`: model evaluation metrics.
+- `weather_data_sources.json`: weather feed metadata for the training window.
+
 ## Automation
 
-A GitHub Actions workflow runs the snapshot job on a schedule in
-`.github/workflows/snapshot.yml`.
+GitHub Actions workflows run the snapshot and prediction jobs on a schedule in
+`.github/workflows/snapshot.yml` and `.github/workflows/predict.yml`.
 
 ## Weather data sources
 
@@ -57,13 +81,13 @@ observations and alert context for Syracuse, NY.
   join on `snapshot_ts`, engineered snowfall rate, temperature, wind, and freezing rain flag).
 - NWS alerts: `api.weather.gov/alerts?point=43.0481,-76.1474` (hourly alert indicator/count).
 
-When the model job runs, it writes `artifacts_snow/weather_data_sources.json` with the
+When the model job runs, it writes `data/artifacts_snow/weather_data_sources.json` with the
 observed time coverage and row counts for each weather feed.
 
 ### NWS alerts log dataset
 
 The alerts collection step appends new alert records to a dedicated dataset at
-`artifacts_snow/nws_alerts_log.csv`. Records are de-duplicated by `alert_id` so the
+`data/artifacts_snow/nws_alerts_log.csv`. Records are de-duplicated by `alert_id` so the
 file grows incrementally over time.
 
 Schema:

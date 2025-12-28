@@ -13,9 +13,10 @@ BASE_QUERY_URL = (
 
 PAGE_SIZE = 2000  # layer maxRecordCount
 REPO_ROOT = Path(__file__).resolve().parents[1]
-STATE_PATH = REPO_ROOT / "snapshot_snow_routes" / "state.json"
-LATEST_GEOJSON_PATH = REPO_ROOT / "snapshot_snow_routes" / "latest_routes.geojson"
-SNAPSHOTS_CSV_PATH = REPO_ROOT / "snapshot_snow_routes" / "snapshots.csv"
+DATA_DIR = REPO_ROOT / "data" / "snapshot_snow_routes"
+STATE_PATH = DATA_DIR / "state.json"
+LATEST_GEOJSON_PATH = DATA_DIR / "latest_routes.geojson"
+SNAPSHOTS_CSV_PATH = DATA_DIR / "snapshots.csv"
 
 # Only changes to these fields create a new historical row.
 CHANGE_FIELDS = [
