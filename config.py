@@ -1,3 +1,6 @@
+import os
+
+
 BASE_URL = (
     "https://services6.arcgis.com/"
     "bdPqSfflsdgFRVVM/arcgis/rest/services/"
@@ -31,6 +34,7 @@ BUCKET_COLORS = {
     "< 1 hour": [44, 162, 95],                       # green-ish
 }
 
-STATE_PATH = "snapshot_snow_routes/state.json"
-LATEST_GEOJSON_PATH = "snapshot_snow_routes/latest_routes.geojson"
-SNAPSHOTS_CSV_PATH = "snapshot_snow_routes/snapshots.csv"
+OUTPUT_DIR = "snapshot_snow_routes/output"
+STATE_PATH = os.path.join(OUTPUT_DIR, "state.json")
+LATEST_GEOJSON_PATH = os.path.join(OUTPUT_DIR, "latest_routes.geojson")
+SNAPSHOTS_CSV_PATH = os.path.join(OUTPUT_DIR, "snapshots.csv")
