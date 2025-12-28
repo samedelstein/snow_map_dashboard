@@ -1,6 +1,7 @@
 import time
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -18,6 +19,11 @@ BASE_URL = (
     "bdPqSfflsdgFRVVM/arcgis/rest/services/"
     "Winter_Operations_Snow_Routes/FeatureServer/0/query"
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+ARTIFACTS_DIR = REPO_ROOT / "data" / "artifacts_snow"
+PREDICTIONS_PROB_PATH = ARTIFACTS_DIR / "predictions_latest_prob.csv"
+NWS_ALERTS_PATH = ARTIFACTS_DIR / "nws_alerts_log.csv"
 
 DEFAULT_CUTOFF_DATE_STR = "2025-12-01"  # UTC cutoff for "this storm"
 DEFAULT_PAGE_SIZE = 2000  # layer maxRecordCount looks like 2000 for you
@@ -190,6 +196,48 @@ def fetch_live_data(_cutoff_iso: str, page_size: int = DEFAULT_PAGE_SIZE):
     return df, fetched_at_utc, len(df)
 
 
+@st.cache_data(show_spinner=False)
+def load_latest_predictions(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+
+    df = pd.read_csv(path)
+    if df.empty:
+        return df
+
+    df["snapshot_ts"] = pd.to_datetime(df["snapshot_ts"], utc=True, errors="coerce")
+    latest_ts = df["snapshot_ts"].max()
+    if pd.isna(latest_ts):
+        return pd.DataFrame()
+
+    latest = df[df["snapshot_ts"] == latest_ts].copy()
+    keep_cols = [
+        "OBJECTID",
+        "p_1h",
+        "p_2h",
+        "p_4h",
+        "p_8h",
+        "eta_hours_60",
+        "eta_ts_60",
+        "eta_hours_pred",
+    ]
+    return latest[[c for c in keep_cols if c in latest.columns]]
+
+
+@st.cache_data(show_spinner=False)
+def load_nws_alerts(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+
+    df = pd.read_csv(path)
+    if df.empty:
+        return df
+
+    df["start_ts"] = pd.to_datetime(df.get("start_ts"), utc=True, errors="coerce")
+    df["end_ts"] = pd.to_datetime(df.get("end_ts"), utc=True, errors="coerce")
+    return df
+
+
 # -----------------------------
 # Sidebar controls
 # -----------------------------
@@ -235,6 +283,12 @@ maybe_autorefresh(auto_refresh, int(refresh_every))
 # (We still keep decorator TTL=60; this makes reruns respect user TTL by cache-keying.)
 df, fetched_at_utc, n_rows = fetch_live_data(cutoff_dt.isoformat(), page_size=DEFAULT_PAGE_SIZE + int(ttl_seconds) * 0)
 
+predictions_df = load_latest_predictions(PREDICTIONS_PROB_PATH)
+if not predictions_df.empty:
+    df = df.merge(predictions_df, on="OBJECTID", how="left")
+    for col in ["p_1h", "p_2h", "p_4h", "p_8h", "eta_hours_60"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
 # -----------------------------
 # Freshness dot for live API
@@ -260,6 +314,27 @@ st.caption(
     f"Anything before {cutoff_dt.date()} is treated as `Never plowed (before cutoff)` for this storm. "
     "Segments with no valid timestamp are ignored."
 )
+
+
+def format_probability(value: float) -> str:
+    if pd.isna(value):
+        return "N/A"
+    return f"{value * 100:.0f}%"
+
+
+def format_eta_hours(value: float) -> str:
+    if pd.isna(value):
+        return "N/A"
+    return f"{value:.1f} hours"
+
+
+def format_route_label(value: float) -> str:
+    if pd.isna(value):
+        return "N/A"
+    try:
+        return f"Route {int(value)}"
+    except (TypeError, ValueError):
+        return str(value)
 
 # CSS (your KPI cards)
 st.markdown(
@@ -370,6 +445,23 @@ for i, row in bucket_miles_df.iterrows():
 with st.expander("Bucket miles data"):
     st.dataframe(bucket_miles_df, width="stretch")
 
+with st.expander("National Weather Service alerts"):
+    alerts_df = load_nws_alerts(NWS_ALERTS_PATH)
+    if alerts_df.empty:
+        st.caption("No National Weather Service alert data available.")
+    else:
+        now_utc = pd.Timestamp.now(tz="UTC")
+        active_alerts = alerts_df[
+            (alerts_df["start_ts"].isna() | (alerts_df["start_ts"] <= now_utc))
+            & (alerts_df["end_ts"].isna() | (alerts_df["end_ts"] >= now_utc))
+        ].copy()
+        display_df = active_alerts if not active_alerts.empty else alerts_df
+        display_df = display_df.sort_values("start_ts", ascending=False).head(10)
+        st.markdown("Source: [NWS active alerts](https://api.weather.gov/alerts/active?area=NY)")
+        st.dataframe(
+            display_df[["event", "severity", "start_ts", "end_ts", "source_url"]],
+            width="stretch",
+        )
 
 # -----------------------------
 # Map
@@ -381,6 +473,20 @@ selected_display = st.multiselect("Show buckets:", options=options, default=opti
 
 selected_buckets = [b for b in BUCKET_ORDER if BUCKET_DISPLAY_LABELS[b] in selected_display]
 map_df = df[df["bucket"].isin(selected_buckets)].copy()
+
+for col in ["p_1h", "p_2h", "p_4h", "p_8h", "eta_hours_60"]:
+    if col not in map_df.columns:
+        map_df[col] = pd.NA
+
+if "snowrouteid" in map_df.columns:
+    map_df["route_label"] = map_df["snowrouteid"].apply(format_route_label)
+else:
+    map_df["route_label"] = "N/A"
+map_df["p_1h_pct"] = map_df["p_1h"].apply(format_probability)
+map_df["p_2h_pct"] = map_df["p_2h"].apply(format_probability)
+map_df["p_4h_pct"] = map_df["p_4h"].apply(format_probability)
+map_df["p_8h_pct"] = map_df["p_8h"].apply(format_probability)
+map_df["eta_60_label"] = map_df["eta_hours_60"].apply(format_eta_hours)
 
 map_df["color"] = map_df["bucket"].map(lambda b: BUCKET_COLORS.get(b, [0, 0, 0]))
 
@@ -414,7 +520,20 @@ st.pydeck_chart(
         layers=[layer],
         initial_view_state=view_state,
         tooltip={
-            "text": "Road: {roadname}\nBucket: {bucket}\nMiles: {miles:.3f}\nLast serviced: {lastserviced_dt}"
+            "text": (
+                "Road: {roadname}\n"
+                "Priority: {routepriority}\n"
+                "Route: {route_label}\n"
+                "Status: {servicestatus}\n"
+                "Bucket: {bucket}\n"
+                "Miles: {miles:.3f}\n"
+                "Last serviced: {lastserviced_dt}\n"
+                "Plow likelihood (next hour): {p_1h_pct}\n"
+                "Plow likelihood (next 2 hours): {p_2h_pct}\n"
+                "Plow likelihood (next 4 hours): {p_4h_pct}\n"
+                "Plow likelihood (next 8 hours): {p_8h_pct}\n"
+                "ETA at 60% likelihood: {eta_60_label}"
+            )
         },
     ),
     width="stretch",
