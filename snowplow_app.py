@@ -512,6 +512,56 @@ with tab_pred:
     )
     join_event = "AUTO" if mode.startswith("AUTO") else selected_event
 
+    AUTO_MATCH_THRESHOLD_PCT = 1.0
+    NO_PRED_STATUS = "NO_PRED_INSUFFICIENT_DATA"
+    join_mode_label = mode
+    match_summary = {"matched": 0, "total": 0, "pct": 0.0}
+    geo_for_map = None
+
+    if geojson_obj:
+        geo_copy = copy.deepcopy(geojson_obj)
+        geo_for_map = attach_predictions_to_geojson(geo_copy, preds, join_event, color_by=color_by)
+        features = geo_for_map.get("features", [])
+        match_summary["total"] = len(features)
+        match_summary["matched"] = sum(
+            1
+            for feat in features
+            if feat.get("properties", {}).get("prediction_status") != NO_PRED_STATUS
+        )
+        match_summary["pct"] = (
+            match_summary["matched"] / match_summary["total"] * 100.0
+            if match_summary["total"] > 0
+            else 0.0
+        )
+
+        if join_event == "AUTO" and match_summary["pct"] < AUTO_MATCH_THRESHOLD_PCT:
+            st.warning(
+                "AUTO join matched ~0% of segments. Switching to Selected storm only "
+                "so predictions can be applied."
+            )
+            join_event = selected_event
+            join_mode_label = "Selected storm only (auto fallback from AUTO)"
+            geo_copy = copy.deepcopy(geojson_obj)
+            geo_for_map = attach_predictions_to_geojson(geo_copy, preds, join_event, color_by=color_by)
+            features = geo_for_map.get("features", [])
+            match_summary["total"] = len(features)
+            match_summary["matched"] = sum(
+                1
+                for feat in features
+                if feat.get("properties", {}).get("prediction_status") != NO_PRED_STATUS
+            )
+            match_summary["pct"] = (
+                match_summary["matched"] / match_summary["total"] * 100.0
+                if match_summary["total"] > 0
+                else 0.0
+            )
+        elif join_event == "AUTO":
+            join_mode_label = "AUTO (use GeoJSON eventid)"
+        else:
+            join_mode_label = "Selected storm only"
+
+    st.caption(f"Prediction join mode in use: {join_mode_label}")
+
     # Filters
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -533,7 +583,7 @@ with tab_pred:
     ok = (view["prediction_status"] == "OK").sum()
     untracked = (view["prediction_status"] != "OK").sum()
 
-    cA, cB, cC, cD = st.columns(4)
+    cA, cB, cC, cD, cE = st.columns(5)
     cA.metric("Segments (filtered)", f"{len(view):,}")
     cB.metric("Predicted (OK)", f"{ok:,}")
     cC.metric("No prediction", f"{untracked:,}")
@@ -541,6 +591,10 @@ with tab_pred:
         cD.metric("Model AUC (≤4h)", f"{metrics[str(4)]['auc']:.3f}")
     else:
         cD.metric("Model AUC (≤4h)", "—")
+    if match_summary["total"] > 0:
+        cE.metric("Segments matched", f"{match_summary['pct']:.1f}%")
+    else:
+        cE.metric("Segments matched", "—")
 
     st.caption("Color scale uses probabilities. Grey segments are untracked/no prediction.")
 
@@ -548,10 +602,6 @@ with tab_pred:
     if not geojson_obj:
         st.warning(f"GeoJSON not found at {GEOJSON_PATH.name}. Add it to render the prediction map.")
     else:
-        # IMPORTANT: deep copy so we don't mutate cached geojson across reruns/events
-        geo_copy = copy.deepcopy(geojson_obj)
-        geo_for_map = attach_predictions_to_geojson(geo_copy, preds, join_event, color_by=color_by)
-
         pred_layer = pdk.Layer(
             "GeoJsonLayer",
             geo_for_map,
