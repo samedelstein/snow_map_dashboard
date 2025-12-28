@@ -27,6 +27,12 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests; fi
 
+      - name: Sync with remote
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+
       - name: Debug - list snapshot folder
         run: |
           ls -la data/snapshot_snow_routes
@@ -45,8 +51,6 @@ jobs:
           set -euxo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git pull --rebase origin main
 
           git status --porcelain
           git add data/snapshot_snow_routes/latest_routes.geojson data/snapshot_snow_routes/snapshots.csv data/snapshot_snow_routes/state.json
