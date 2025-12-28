@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.neighbors import BallTree
@@ -238,33 +239,95 @@ def add_horizon_labels(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 def train_models(
     df: pd.DataFrame, features: list[str]
-) -> tuple[dict[int, HistGradientBoostingClassifier | None], dict[int, dict], pd.Series]:
+) -> tuple[
+    dict[int, HistGradientBoostingClassifier | None],
+    dict[int, CalibratedClassifierCV | HistGradientBoostingClassifier | None],
+    dict[int, dict],
+    pd.Series,
+]:
     if df.empty:
-        return {}, {}, pd.Series(dtype=float)
+        return {}, {}, {}, pd.Series(dtype=float)
 
     cutoff = df[TS].quantile(0.8)
-    train_mask = df[TS] <= cutoff
+    train_val_mask = df[TS] <= cutoff
+    train_val_df = df[train_val_mask]
+    if train_val_df.empty:
+        val_cutoff = cutoff
+    else:
+        val_cutoff = train_val_df[TS].quantile(0.8)
+    train_mask = df[TS] <= val_cutoff
+    val_mask = (df[TS] > val_cutoff) & train_val_mask
+    test_mask = ~train_val_mask
 
     X = df[features].replace([np.inf, -np.inf], np.nan)
     medians = X.median(numeric_only=True)
     X = X.fillna(medians)
 
     models: dict[int, HistGradientBoostingClassifier | None] = {}
+    calibrated_models: dict[
+        int, CalibratedClassifierCV | HistGradientBoostingClassifier | None
+    ] = {}
     metrics: dict[int, dict] = {}
+
+    def calibration_metrics(
+        y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10
+    ) -> dict[str, Any]:
+        total = len(y_true)
+        if total == 0:
+            return {"ece": None, "bins": []}
+        bins = np.linspace(0.0, 1.0, n_bins + 1)
+        bin_ids = np.digitize(y_prob, bins) - 1
+        bin_ids = np.clip(bin_ids, 0, n_bins - 1)
+        rows = []
+        ece = 0.0
+        for i in range(n_bins):
+            mask = bin_ids == i
+            count = int(mask.sum())
+            if count == 0:
+                rows.append(
+                    {
+                        "bin": i,
+                        "lower": float(bins[i]),
+                        "upper": float(bins[i + 1]),
+                        "count": 0,
+                        "mean_pred": None,
+                        "frac_pos": None,
+                    }
+                )
+                continue
+            mean_pred = float(np.mean(y_prob[mask]))
+            frac_pos = float(np.mean(y_true[mask]))
+            ece += abs(frac_pos - mean_pred) * (count / total)
+            rows.append(
+                {
+                    "bin": i,
+                    "lower": float(bins[i]),
+                    "upper": float(bins[i + 1]),
+                    "count": count,
+                    "mean_pred": mean_pred,
+                    "frac_pos": frac_pos,
+                }
+            )
+        return {"ece": float(ece), "bins": rows}
 
     for h in HORIZONS:
         y = df[f"y_{h}h"].astype(int)
         X_train, y_train = X[train_mask], y[train_mask]
-        X_test, y_test = X[~train_mask], y[~train_mask]
+        X_val, y_val = X[val_mask], y[val_mask]
+        X_test, y_test = X[test_mask], y[test_mask]
 
         if X_train.empty or y_train.nunique() < 2:
             models[h] = None
+            calibrated_models[h] = None
             metrics[h] = {
                 "rows_train": int(X_train.shape[0]),
+                "rows_val": int(X_val.shape[0]),
                 "rows_test": int(X_test.shape[0]),
                 "auc": None,
                 "brier": None,
+                "calibration": {"ece": None, "bins": []},
                 "cutoff_utc": str(cutoff),
+                "val_cutoff_utc": str(val_cutoff),
                 "note": "insufficient training data",
             }
             continue
@@ -277,24 +340,38 @@ def train_models(
         )
         clf.fit(X_train, y_train)
         models[h] = clf
+        calibrated_model: CalibratedClassifierCV | HistGradientBoostingClassifier = clf
+
+        if not X_val.empty and y_val.nunique() >= 2:
+            calibrator = CalibratedClassifierCV(
+                estimator=clf, cv="prefit", method="sigmoid"
+            )
+            calibrator.fit(X_val, y_val)
+            calibrated_model = calibrator
+        calibrated_models[h] = calibrated_model
 
         if X_test.empty or y_test.nunique() < 2:
             auc = None
             brier = None
+            calibration = {"ece": None, "bins": []}
         else:
-            p = clf.predict_proba(X_test)[:, 1]
+            p = calibrated_model.predict_proba(X_test)[:, 1]
             auc = float(roc_auc_score(y_test, p))
             brier = float(brier_score_loss(y_test, p))
+            calibration = calibration_metrics(y_test.to_numpy(), p)
 
         metrics[h] = {
             "rows_train": int(X_train.shape[0]),
+            "rows_val": int(X_val.shape[0]),
             "rows_test": int(X_test.shape[0]),
             "auc": auc,
             "brier": brier,
+            "calibration": calibration,
             "cutoff_utc": str(cutoff),
+            "val_cutoff_utc": str(val_cutoff),
         }
 
-    return models, metrics, medians
+    return models, calibrated_models, metrics, medians
 
 
 # -----------------------------
@@ -303,6 +380,9 @@ def train_models(
 def predict_latest(
     df: pd.DataFrame,
     models: dict[int, HistGradientBoostingClassifier | None],
+    calibrated_models: dict[
+        int, CalibratedClassifierCV | HistGradientBoostingClassifier | None
+    ],
     medians: pd.Series,
     features: list[str],
 ) -> pd.DataFrame:
@@ -323,7 +403,7 @@ def predict_latest(
         X_now = X_now.fillna(0)
 
     for h in HORIZONS:
-        model = models.get(h)
+        model = calibrated_models.get(h) or models.get(h)
         if model is None:
             latest[f"p_{h}h"] = np.nan
         else:
@@ -388,9 +468,11 @@ def main() -> None:
     ]
 
     train_df = featured[featured["prediction_status"] == "OK"].copy()
-    models, metrics, medians = train_models(train_df, feature_cols)
+    models, calibrated_models, metrics, medians = train_models(train_df, feature_cols)
 
-    pred_latest = predict_latest(featured, models, medians, feature_cols)
+    pred_latest = predict_latest(
+        featured, models, calibrated_models, medians, feature_cols
+    )
     pred_path = os.path.join(ARTIFACT_DIR, "predictions_latest_prob.csv")
     pred_latest.to_csv(pred_path, index=False)
 
