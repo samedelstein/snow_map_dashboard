@@ -368,10 +368,6 @@ def attach_predictions_to_geojson(geojson_obj: dict, preds: pd.DataFrame, eventi
             else:
                 props["_line_color"] = prob_to_color(row.get(color_by))
 
-        props["p_1h_pct"] = format_probability(props.get("p_1h"))
-        props["p_2h_pct"] = format_probability(props.get("p_2h"))
-        props["p_4h_pct"] = format_probability(props.get("p_4h"))
-        props["p_8h_pct"] = format_probability(props.get("p_8h"))
         feat["properties"] = props
 
     return geojson_obj
@@ -463,10 +459,7 @@ with tab_live:
 
     predictions_df = load_latest_predictions(PREDICTIONS_PROB_PATH)
     if not predictions_df.empty:
-        if "snowroutesegmentid" in df.columns and "snowroutesegmentid" in predictions_df.columns:
-            df = df.merge(predictions_df, on="snowroutesegmentid", how="left")
-        else:
-            df = df.merge(predictions_df, on="OBJECTID", how="left")
+        df = df.merge(predictions_df, on="OBJECTID", how="left")
         for col in ["p_1h", "p_2h", "p_4h", "p_8h", "eta_hours_60"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -855,10 +848,10 @@ with tab_pred:
             Priority: {routepriority}<br/>
             Route: {snowrouteid}<br/>
             Status: {prediction_status}<br/>
-            Plow likelihood (next hour): {p_1h_pct}<br/>
-            Plow likelihood (next 2 hours): {p_2h_pct}<br/>
-            Plow likelihood (next 4 hours): {p_4h_pct}<br/>
-            Plow likelihood (next 8 hours): {p_8h_pct}<br/>
+            p(≤1h): {p_1h}<br/>
+            p(≤2h): {p_2h}<br/>
+            p(≤4h): {p_4h}<br/>
+            p(≤8h): {p_8h}<br/>
             ETA@60%: {eta_hours_60}h
             """,
             "style": {"backgroundColor": "white", "color": "black"},
