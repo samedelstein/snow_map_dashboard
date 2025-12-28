@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.neighbors import BallTree
@@ -32,6 +33,10 @@ HORIZONS = [1, 2, 4, 8]
 ETA_THRESHOLD = 0.60
 ARTIFACT_DIR = "artifacts_snow"
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+NOAA_STATION_ID = "KSYR"
+NWS_POINT = "43.0481,-76.1474"
+NWS_USER_AGENT = "snow_map_dashboard (https://github.com/samedelstein/snow_map_dashboard)"
 
 
 # -----------------------------
@@ -114,6 +119,196 @@ def build_neighbor_lookup(centroids: pd.DataFrame, k: int = 12) -> dict[str, lis
     }
 
 
+def _safe_value(payload: Any) -> float | None:
+    if isinstance(payload, dict):
+        return payload.get("value")
+    return None
+
+
+def _collect_paginated(url: str, params: dict[str, str]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    next_url = url
+    next_params = params
+    headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
+
+    while next_url:
+        try:
+            resp = requests.get(
+                next_url, params=next_params, headers=headers, timeout=30
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            print(f"Weather API request failed: {exc}")
+            break
+
+        data = resp.json()
+        results.extend(data.get("features", []))
+        next_url = data.get("pagination", {}).get("next")
+        next_params = None
+
+    return results
+
+
+def load_noaa_observations(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    url = f"https://api.weather.gov/stations/{NOAA_STATION_ID}/observations"
+    params = {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "limit": "500",
+    }
+    features = _collect_paginated(url, params)
+    rows: list[dict[str, Any]] = []
+    for feat in features:
+        props = feat.get("properties", {}) or {}
+        ts = pd.to_datetime(props.get("timestamp"), utc=True, errors="coerce")
+        if pd.isna(ts):
+            continue
+        present_weather = props.get("presentWeather")
+        rows.append(
+            {
+                "obs_ts": ts,
+                "temp_c": _safe_value(props.get("temperature")),
+                "wind_speed_mps": _safe_value(props.get("windSpeed")),
+                "wind_gust_mps": _safe_value(props.get("windGust")),
+                "precip_mm": _safe_value(props.get("precipitationLastHour")),
+                "snowfall_mm": _safe_value(props.get("snowfallLastHour")),
+                "present_weather": json.dumps(present_weather),
+                "text_description": props.get("textDescription"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_weather_features(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if df.empty:
+        return pd.DataFrame(), {"observations": {}, "station_id": NOAA_STATION_ID}
+
+    start = df[TS].min().floor("h") - pd.Timedelta(hours=1)
+    end = df[TS].max().ceil("h") + pd.Timedelta(hours=1)
+
+    obs = load_noaa_observations(start, end)
+    if obs.empty:
+        return pd.DataFrame(), {
+            "observations": {"start": str(start), "end": str(end), "rows": 0},
+            "station_id": NOAA_STATION_ID,
+        }
+
+    obs = obs.sort_values("obs_ts")
+    obs["hour_bucket"] = obs["obs_ts"].dt.floor("h")
+    hourly = obs.groupby("hour_bucket", as_index=False).tail(1).copy()
+
+    hourly["snowfall_rate_mmhr"] = hourly["snowfall_mm"]
+    temp_c = hourly["temp_c"]
+    precip_mm = hourly["precip_mm"].fillna(0)
+    hourly.loc[hourly["snowfall_rate_mmhr"].isna(), "snowfall_rate_mmhr"] = (
+        np.where(temp_c <= 0, precip_mm, np.nan)
+    )
+
+    present = hourly["present_weather"].fillna("").str.lower()
+    desc = hourly["text_description"].fillna("").str.lower()
+    hourly["freezing_rain"] = (
+        (temp_c <= 0)
+        & (precip_mm > 0)
+        & (present.str.contains("fzra") | desc.str.contains("freezing"))
+    ).astype(int)
+
+    weather_meta = {
+        "station_id": NOAA_STATION_ID,
+        "observations": {
+            "start": str(hourly["obs_ts"].min()),
+            "end": str(hourly["obs_ts"].max()),
+            "rows": int(hourly.shape[0]),
+        },
+    }
+
+    return (
+        hourly[
+            [
+                "hour_bucket",
+                "temp_c",
+                "wind_speed_mps",
+                "wind_gust_mps",
+                "snowfall_rate_mmhr",
+                "freezing_rain",
+            ]
+        ],
+        weather_meta,
+    )
+
+
+def load_nws_alerts(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    url = "https://api.weather.gov/alerts"
+    params = {"point": NWS_POINT, "start": start.isoformat(), "end": end.isoformat()}
+    features = _collect_paginated(url, params)
+    rows: list[dict[str, Any]] = []
+    for feat in features:
+        props = feat.get("properties", {}) or {}
+        onset = pd.to_datetime(props.get("onset"), utc=True, errors="coerce")
+        effective = pd.to_datetime(props.get("effective"), utc=True, errors="coerce")
+        ends = pd.to_datetime(props.get("ends"), utc=True, errors="coerce")
+        expires = pd.to_datetime(props.get("expires"), utc=True, errors="coerce")
+        start_ts = onset if pd.notna(onset) else effective
+        end_ts = ends if pd.notna(ends) else expires
+        if pd.isna(start_ts) or pd.isna(end_ts):
+            continue
+        rows.append(
+            {
+                "alert_id": props.get("id") or props.get("@id"),
+                "event": props.get("event"),
+                "severity": props.get("severity"),
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_alert_features(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if df.empty:
+        return pd.DataFrame(), {"alerts": {}, "point": NWS_POINT}
+
+    start = df[TS].min().floor("h") - pd.Timedelta(hours=1)
+    end = df[TS].max().ceil("h") + pd.Timedelta(hours=1)
+    alerts = load_nws_alerts(start, end)
+
+    if alerts.empty:
+        return pd.DataFrame(), {
+            "alerts": {"start": str(start), "end": str(end), "rows": 0},
+            "point": NWS_POINT,
+        }
+
+    hours = pd.date_range(start=start, end=end, freq="h", tz="UTC")
+    alert_counts = pd.Series(0, index=hours)
+
+    for row in alerts.itertuples(index=False):
+        active_hours = hours[(hours >= row.start_ts) & (hours <= row.end_ts)]
+        alert_counts.loc[active_hours] += 1
+
+    alerts_hourly = (
+        alert_counts.rename_axis("hour_bucket")
+        .reset_index(name="nws_alert_count")
+        .copy()
+    )
+    alerts_hourly["nws_alert_active"] = (alerts_hourly["nws_alert_count"] > 0).astype(
+        int
+    )
+
+    alert_meta = {
+        "point": NWS_POINT,
+        "alerts": {
+            "start": str(alerts["start_ts"].min()),
+            "end": str(alerts["end_ts"].max()),
+            "rows": int(alerts.shape[0]),
+        },
+    }
+
+    return alerts_hourly, alert_meta
+
+
 # -----------------------------
 # Event + label building
 # -----------------------------
@@ -154,7 +349,11 @@ def label_next_service(df: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
 # Feature engineering
 # -----------------------------
 def add_features(
-    df: pd.DataFrame, events: pd.DataFrame, neighbor_lookup: dict[str, list[str]]
+    df: pd.DataFrame,
+    events: pd.DataFrame,
+    neighbor_lookup: dict[str, list[str]],
+    weather_hourly: pd.DataFrame | None = None,
+    alerts_hourly: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     f = df.sort_values([EVENT, SEG, TS]).copy()
 
@@ -205,6 +404,21 @@ def add_features(
         f["neighbor_services_last_hour"] = f.apply(neighbor_sum, axis=1)
     else:
         f["neighbor_services_last_hour"] = 0
+
+    if weather_hourly is not None and not weather_hourly.empty:
+        f = f.merge(weather_hourly, on="hour_bucket", how="left")
+    else:
+        f["temp_c"] = np.nan
+        f["wind_speed_mps"] = np.nan
+        f["wind_gust_mps"] = np.nan
+        f["snowfall_rate_mmhr"] = np.nan
+        f["freezing_rain"] = 0
+
+    if alerts_hourly is not None and not alerts_hourly.empty:
+        f = f.merge(alerts_hourly, on="hour_bucket", how="left")
+    else:
+        f["nws_alert_count"] = 0
+        f["nws_alert_active"] = 0
 
     return f
 
@@ -371,7 +585,11 @@ def main() -> None:
 
     events = build_events(snapshots)
     labeled = label_next_service(snapshots, events)
-    featured = add_features(labeled, events, neighbor_lookup)
+    weather_hourly, weather_meta = build_weather_features(labeled)
+    alerts_hourly, alerts_meta = build_alert_features(labeled)
+    featured = add_features(
+        labeled, events, neighbor_lookup, weather_hourly, alerts_hourly
+    )
     featured = mark_untracked(featured)
     featured = add_horizon_labels(featured)
 
@@ -385,6 +603,13 @@ def main() -> None:
         "city_services_last_hour",
         "route_services_last_hour",
         "neighbor_services_last_hour",
+        "temp_c",
+        "wind_speed_mps",
+        "wind_gust_mps",
+        "snowfall_rate_mmhr",
+        "freezing_rain",
+        "nws_alert_count",
+        "nws_alert_active",
     ]
 
     train_df = featured[featured["prediction_status"] == "OK"].copy()
@@ -398,8 +623,20 @@ def main() -> None:
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
+    weather_path = os.path.join(ARTIFACT_DIR, "weather_data_sources.json")
+    with open(weather_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "noaa_observations": weather_meta,
+                "nws_alerts": alerts_meta,
+            },
+            f,
+            indent=2,
+        )
+
     print(f"Saved: {pred_path} | rows: {len(pred_latest)}")
     print(f"Saved: {metrics_path}")
+    print(f"Saved: {weather_path}")
 
     if not pred_latest.empty:
         untracked_share = (pred_latest["prediction_status"] != "OK").mean()

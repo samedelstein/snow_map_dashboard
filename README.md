@@ -44,3 +44,15 @@ Generated files (all under `snapshot_snow_routes/`):
 
 A GitHub Actions workflow runs the snapshot job on a schedule in
 `.github/workflows/snapshot.yml`.
+
+## Weather data sources
+
+The training pipeline (`snow_predict.py`) enriches each snapshot with hourly weather
+observations and alert context for Syracuse, NY.
+
+- NOAA/NWS hourly observations: `api.weather.gov/stations/KSYR/observations` (nearest-hour
+  join on `snapshot_ts`, engineered snowfall rate, temperature, wind, and freezing rain flag).
+- NWS alerts: `api.weather.gov/alerts?point=43.0481,-76.1474` (hourly alert indicator/count).
+
+When the model job runs, it writes `artifacts_snow/weather_data_sources.json` with the
+observed time coverage and row counts for each weather feed.
