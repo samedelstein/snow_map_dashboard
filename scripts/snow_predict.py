@@ -990,11 +990,10 @@ def main() -> None:
         return
 
     geo_df = load_geojson_features(GEOJSON_PATH)
-    if not geo_df.empty:
-        snapshots = snapshots.merge(
-            geo_df[[SEG, EVENT, "passes_phase"]], on=[SEG, EVENT], how="left"
+    if "passes_phase" in snapshots.columns:
+        snapshots["passes_event"] = snapshots["passes_phase"].fillna(
+            snapshots["passes"]
         )
-        snapshots["passes_event"] = snapshots["passes_phase"].fillna(snapshots["passes"])
     else:
         snapshots["passes_event"] = snapshots["passes"]
 
