@@ -753,8 +753,8 @@ def train_models(
         models[h] = clf
 
         if not X_calib.empty and y_calib.nunique() >= 2:
-            calibrator = CalibratedClassifierCV(clf, cv="prefit", method="sigmoid")
-            calibrator.fit(X_calib, y_calib)
+            calibrator = CalibratedClassifierCV(clf, cv=5, method="sigmoid")
+            calibrator.fit(X_train, y_train)
             calibrated[h] = calibrator
         else:
             calibrated[h] = None
@@ -990,11 +990,10 @@ def main() -> None:
         return
 
     geo_df = load_geojson_features(GEOJSON_PATH)
-    if not geo_df.empty:
-        snapshots = snapshots.merge(
-            geo_df[[SEG, EVENT, "passes_phase"]], on=[SEG, EVENT], how="left"
+    if "passes_phase" in snapshots.columns:
+        snapshots["passes_event"] = snapshots["passes_phase"].fillna(
+            snapshots["passes"]
         )
-        snapshots["passes_event"] = snapshots["passes_phase"].fillna(snapshots["passes"])
     else:
         snapshots["passes_event"] = snapshots["passes"]
 

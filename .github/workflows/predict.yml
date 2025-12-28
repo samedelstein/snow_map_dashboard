@@ -35,9 +35,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git status --porcelain
-          git add data/artifacts_snow/predictions_latest_prob.csv data/artifacts_snow/model_metrics_prob.json data/artifacts_snow/weather_data_sources.json data/artifacts_snow/nws_alerts_log.csv
+          git add data/artifacts_snow/predictions_latest_prob.csv data/artifacts_snow/model_metrics_prob.json data/artifacts_snow/weather_data_sources.json data/artifacts_snow/nws_alerts_log.csv data/artifacts_snow/feature_importance.json
           git status --porcelain
           git diff --cached --name-status
 
           git commit -m "predict: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || exit 0
+          git pull --rebase origin "${GITHUB_REF_NAME}"
           git push
