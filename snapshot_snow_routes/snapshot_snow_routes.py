@@ -7,15 +7,9 @@ from datetime import datetime, timezone
 
 import requests
 
-BASE_QUERY_URL = (
-    "https://services6.arcgis.com/bdPqSfflsdgFRVVM/arcgis/rest/services/"
-    "Winter_Operations_Snow_Routes/FeatureServer/0/query"
-)
+from config import BASE_URL, LATEST_GEOJSON_PATH, SNAPSHOTS_CSV_PATH, STATE_PATH
 
 PAGE_SIZE = 2000  # layer maxRecordCount
-STATE_PATH = "snapshot_snow_routes/state.json"
-LATEST_GEOJSON_PATH = "snapshot_snow_routes/latest_routes.geojson"
-SNAPSHOTS_CSV_PATH = "snapshot_snow_routes/snapshots.csv"
 
 # Only changes to these fields create a new historical row.
 CHANGE_FIELDS = [
@@ -70,7 +64,7 @@ def fetch_all_features_esrijson():
             "resultOffset": offset,
             "resultRecordCount": PAGE_SIZE,
         }
-        r = requests.get(BASE_QUERY_URL, params=params, timeout=60)
+        r = requests.get(BASE_URL, params=params, timeout=60)
         r.raise_for_status()
         data = r.json()
 

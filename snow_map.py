@@ -7,47 +7,16 @@ import requests
 import streamlit as st
 import pydeck as pdk
 
+from config import BASE_URL, BUCKET_COLORS, BUCKET_DISPLAY_LABELS, BUCKET_ORDER
+
 
 # -----------------------------
 # Config
 # -----------------------------
 st.set_page_config(page_title="Syracuse Snow Routes – Live Plowing Status", layout="wide")
 
-BASE_URL = (
-    "https://services6.arcgis.com/"
-    "bdPqSfflsdgFRVVM/arcgis/rest/services/"
-    "Winter_Operations_Snow_Routes/FeatureServer/0/query"
-)
-
 DEFAULT_CUTOFF_DATE_STR = "2025-12-01"  # UTC cutoff for "this storm"
 DEFAULT_PAGE_SIZE = 2000  # layer maxRecordCount looks like 2000 for you
-
-BUCKET_ORDER = [
-    "Never plowed (before cutoff)",
-    "> 24 hours",
-    "12–24 hours",
-    "6–12 hours",
-    "1–6 hours",
-    "< 1 hour",
-]
-
-BUCKET_DISPLAY_LABELS = {
-    "Never plowed (before cutoff)": "⬜ Never plowed (before cutoff)",
-    "> 24 hours": "🟥 > 24 hours",
-    "12–24 hours": "🟥 12–24 hours",
-    "6–12 hours": "🟧 6–12 hours",
-    "1–6 hours": "🟨 1–6 hours",
-    "< 1 hour": "🟩 < 1 hour",
-}
-
-BUCKET_COLORS = {
-    "Never plowed (before cutoff)": [200, 200, 200],  # gray
-    "> 24 hours": [128, 0, 38],                      # dark red
-    "12–24 hours": [227, 26, 28],                    # red
-    "6–12 hours": [253, 141, 60],                    # orange
-    "1–6 hours": [255, 237, 111],                    # yellow
-    "< 1 hour": [44, 162, 95],                       # green-ish
-}
 
 
 # -----------------------------
