@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from lifelines import CoxPHFitter
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.neighbors import BallTree
@@ -134,6 +135,8 @@ def label_next_service(df: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     }
 
     labeled = df.sort_values([EVENT, SEG, TS]).copy()
+    last_snapshot = labeled.groupby([EVENT, SEG])[TS].max().rename("last_snapshot_ts")
+    labeled = labeled.merge(last_snapshot, on=[EVENT, SEG], how="left")
     next_times = []
     for row in labeled[[EVENT, SEG, TS]].itertuples(index=False):
         times = svc_times.get((row.eventid, row.snowroutesegmentid))
@@ -147,6 +150,13 @@ def label_next_service(df: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     labeled["hours_to_next_service"] = (
         labeled["next_serviced_at"] - labeled[TS]
     ).dt.total_seconds() / 3600.0
+    labeled["hours_to_censor"] = (
+        labeled["last_snapshot_ts"] - labeled[TS]
+    ).dt.total_seconds() / 3600.0
+    labeled["event_observed"] = labeled["hours_to_next_service"].notna().astype(int)
+    labeled["duration_hours"] = labeled["hours_to_next_service"].where(
+        labeled["event_observed"].eq(1), labeled["hours_to_censor"]
+    )
     return labeled
 
 
@@ -298,6 +308,39 @@ def train_models(
 
 
 # -----------------------------
+# Train survival model
+# -----------------------------
+def train_survival_model(
+    df: pd.DataFrame, features: list[str]
+) -> tuple[CoxPHFitter | None, pd.Series, dict]:
+    if df.empty:
+        return None, pd.Series(dtype=float), {}
+
+    work = df.copy()
+    work = work[work["duration_hours"].notna()].copy()
+    work = work[work["duration_hours"] > 0]
+    if work.empty:
+        return None, pd.Series(dtype=float), {}
+
+    X = work[features].replace([np.inf, -np.inf], np.nan)
+    medians = X.median(numeric_only=True)
+    X = X.fillna(medians)
+
+    model_df = X.copy()
+    model_df["duration_hours"] = work["duration_hours"]
+    model_df["event_observed"] = work["event_observed"].astype(int)
+
+    cph = CoxPHFitter(penalizer=0.1)
+    cph.fit(model_df, duration_col="duration_hours", event_col="event_observed")
+
+    metrics = {
+        "rows_train": int(model_df.shape[0]),
+        "concordance": float(cph.concordance_index_),
+    }
+    return cph, medians, metrics
+
+
+# -----------------------------
 # Predict latest per segment
 # -----------------------------
 def predict_latest(
@@ -305,6 +348,8 @@ def predict_latest(
     models: dict[int, HistGradientBoostingClassifier | None],
     medians: pd.Series,
     features: list[str],
+    survival_model: CoxPHFitter | None,
+    survival_medians: pd.Series,
 ) -> pd.DataFrame:
     latest = (
         df.sort_values([EVENT, SEG, TS])
@@ -342,10 +387,43 @@ def predict_latest(
     latest["eta_hours_60"] = latest.apply(eta, axis=1)
     latest["eta_ts_60"] = latest[TS] + pd.to_timedelta(latest["eta_hours_60"], unit="h")
 
+    if survival_model is None:
+        latest["eta_hours_pred"] = np.nan
+        latest["eta_hours_ci_low"] = np.nan
+        latest["eta_hours_ci_high"] = np.nan
+    else:
+        X_surv = latest[features].replace([np.inf, -np.inf], np.nan)
+        if not survival_medians.empty:
+            X_surv = X_surv.fillna(survival_medians)
+        else:
+            X_surv = X_surv.fillna(0)
+
+        eta_median = survival_model.predict_median(X_surv)
+        eta_low = survival_model.predict_percentile(X_surv, p=0.9)
+        eta_high = survival_model.predict_percentile(X_surv, p=0.1)
+
+        latest["eta_hours_pred"] = eta_median.to_numpy()
+        latest["eta_hours_ci_low"] = eta_low.to_numpy()
+        latest["eta_hours_ci_high"] = eta_high.to_numpy()
+
+    latest["eta_ts_pred"] = latest[TS] + pd.to_timedelta(latest["eta_hours_pred"], unit="h")
+    latest["eta_ts_ci_low"] = latest[TS] + pd.to_timedelta(latest["eta_hours_ci_low"], unit="h")
+    latest["eta_ts_ci_high"] = latest[TS] + pd.to_timedelta(latest["eta_hours_ci_high"], unit="h")
+
     for h in HORIZONS:
         latest.loc[latest["prediction_status"] != "OK", f"p_{h}h"] = np.nan
     latest.loc[
-        latest["prediction_status"] != "OK", ["eta_hours_60", "eta_ts_60"]
+        latest["prediction_status"] != "OK",
+        [
+            "eta_hours_60",
+            "eta_ts_60",
+            "eta_hours_pred",
+            "eta_hours_ci_low",
+            "eta_hours_ci_high",
+            "eta_ts_pred",
+            "eta_ts_ci_low",
+            "eta_ts_ci_high",
+        ],
     ] = np.nan
 
     return latest
@@ -389,8 +467,18 @@ def main() -> None:
 
     train_df = featured[featured["prediction_status"] == "OK"].copy()
     models, metrics, medians = train_models(train_df, feature_cols)
+    survival_model, survival_medians, survival_metrics = train_survival_model(
+        train_df, feature_cols
+    )
 
-    pred_latest = predict_latest(featured, models, medians, feature_cols)
+    pred_latest = predict_latest(
+        featured,
+        models,
+        medians,
+        feature_cols,
+        survival_model,
+        survival_medians,
+    )
     pred_path = os.path.join(ARTIFACT_DIR, "predictions_latest_prob.csv")
     pred_latest.to_csv(pred_path, index=False)
 
@@ -398,8 +486,13 @@ def main() -> None:
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
+    survival_metrics_path = os.path.join(ARTIFACT_DIR, "model_metrics_survival.json")
+    with open(survival_metrics_path, "w", encoding="utf-8") as f:
+        json.dump(survival_metrics, f, indent=2)
+
     print(f"Saved: {pred_path} | rows: {len(pred_latest)}")
     print(f"Saved: {metrics_path}")
+    print(f"Saved: {survival_metrics_path}")
 
     if not pred_latest.empty:
         untracked_share = (pred_latest["prediction_status"] != "OK").mean()
