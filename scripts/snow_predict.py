@@ -498,6 +498,13 @@ def add_features(
         )
         return out.reindex(data.index)
 
+    def group_apply_no_groups(df: pd.DataFrame, by: list[str], func, **kwargs):
+        grouped = df.groupby(by, group_keys=False)
+        try:
+            return grouped.apply(func, include_groups=False, **kwargs)
+        except TypeError:
+            return grouped.apply(func, **kwargs)
+
     for window in [3, 6]:
         f[f"seg_services_{window}h"] = rolling_sum_by_group(
             f, [EVENT, SEG], "lastserviced_changed", window
