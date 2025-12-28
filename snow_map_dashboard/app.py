@@ -199,6 +199,9 @@ def fetch_live_data(_cutoff_iso: str, page_size: int = DEFAULT_PAGE_SIZE):
 
     df["bucket"] = df["lastserviced_dt"].apply(classify_dt)
 
+    if "snowroutesegmentid" in df.columns:
+        df["snowroutesegmentid"] = df["snowroutesegmentid"].astype(str)
+
     fetched_at_utc = datetime.now(timezone.utc).isoformat()
     return df, fetched_at_utc, len(df)
 
@@ -218,8 +221,11 @@ def load_latest_predictions(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
     latest = df[df["snapshot_ts"] == latest_ts].copy()
+    if "snowroutesegmentid" in latest.columns:
+        latest["snowroutesegmentid"] = latest["snowroutesegmentid"].astype(str)
     keep_cols = [
         "OBJECTID",
+        "snowroutesegmentid",
         "p_1h",
         "p_2h",
         "p_4h",
