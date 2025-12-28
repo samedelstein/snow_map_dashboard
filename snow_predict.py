@@ -45,6 +45,7 @@ HORIZONS = [1, 2, 4, 8]
 ETA_THRESHOLD = 0.60
 ARTIFACT_DIR = "artifacts_snow"
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
+ALERT_LOG_PATH = os.path.join(ARTIFACT_DIR, "nws_alerts_log.csv")
 
 NOAA_STATION_ID = "KSYR"
 NWS_POINT = "43.0481,-76.1474"
@@ -284,27 +285,65 @@ def load_nws_alerts(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         end_ts = ends if pd.notna(ends) else expires
         if pd.isna(start_ts) or pd.isna(end_ts):
             continue
+        alert_id = props.get("id") or props.get("identifier") or props.get("@id")
+        source_url = props.get("@id") or props.get("uri") or props.get("id")
         rows.append(
             {
-                "alert_id": props.get("id") or props.get("@id"),
+                "alert_id": alert_id,
                 "event": props.get("event"),
                 "severity": props.get("severity"),
                 "start_ts": start_ts,
                 "end_ts": end_ts,
+                "source_url": source_url,
             }
         )
     return pd.DataFrame(rows)
 
 
+def _alert_window(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
+    start = df[TS].min().floor("h") - pd.Timedelta(hours=1)
+    end = df[TS].max().ceil("h") + pd.Timedelta(hours=1)
+    return start, end
+
+
+def persist_alert_log(
+    alerts: pd.DataFrame, path: str = ALERT_LOG_PATH
+) -> dict[str, Any]:
+    columns = ["alert_id", "event", "start_ts", "end_ts", "severity", "source_url"]
+    if alerts.empty and not os.path.exists(path):
+        return {"path": path, "rows": 0, "added": 0}
+
+    log_df = alerts.reindex(columns=columns).copy()
+    if not log_df.empty:
+        log_df["start_ts"] = pd.to_datetime(log_df["start_ts"], utc=True)
+        log_df["end_ts"] = pd.to_datetime(log_df["end_ts"], utc=True)
+
+    if os.path.exists(path):
+        existing = pd.read_csv(path)
+        combined = pd.concat([existing, log_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["alert_id"], keep="last")
+        added = len(combined) - len(existing)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        combined = log_df.drop_duplicates(subset=["alert_id"], keep="last")
+        added = len(combined)
+
+    if not combined.empty:
+        combined = combined.sort_values("start_ts")
+    combined.to_csv(path, index=False)
+    return {"path": path, "rows": int(len(combined)), "added": int(added)}
+
+
 def build_alert_features(
     df: pd.DataFrame,
+    alerts: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if df.empty:
         return pd.DataFrame(), {"alerts": {}, "point": NWS_POINT}
 
-    start = df[TS].min().floor("h") - pd.Timedelta(hours=1)
-    end = df[TS].max().ceil("h") + pd.Timedelta(hours=1)
-    alerts = load_nws_alerts(start, end)
+    start, end = _alert_window(df)
+    if alerts is None:
+        alerts = load_nws_alerts(start, end)
 
     if alerts.empty:
         return pd.DataFrame(), {
@@ -962,7 +1001,10 @@ def main() -> None:
     events = build_events(snapshots)
     labeled = label_next_service(snapshots, events)
     weather_hourly, weather_meta = build_weather_features(labeled)
-    alerts_hourly, alerts_meta = build_alert_features(labeled)
+    alert_start, alert_end = _alert_window(labeled)
+    alert_rows = load_nws_alerts(alert_start, alert_end)
+    alerts_log_meta = persist_alert_log(alert_rows)
+    alerts_hourly, alerts_meta = build_alert_features(labeled, alert_rows)
     featured = add_features(
         labeled, events, neighbor_lookup, weather_hourly, alerts_hourly
     )
@@ -1040,6 +1082,7 @@ def main() -> None:
             {
                 "noaa_observations": weather_meta,
                 "nws_alerts": alerts_meta,
+                "nws_alerts_log": alerts_log_meta,
             },
             f,
             indent=2,
