@@ -485,40 +485,47 @@ def add_features(
             index=g.index,
         )
 
+    def group_apply_no_groups(df: pd.DataFrame, by: list[str], func, **kwargs):
+        grouped = df.groupby(by, group_keys=False)
+        try:
+            return grouped.apply(func, include_groups=False, **kwargs)
+        except TypeError:
+            return grouped.apply(func, **kwargs)
+
     for window in [3, 6]:
         f[f"seg_services_{window}h"] = (
-            f.groupby([EVENT, SEG], group_keys=False)
-            .apply(rolling_sum, value_col="lastserviced_changed", window=window)
-            .fillna(0)
+            group_apply_no_groups(
+                f, [EVENT, SEG], rolling_sum, value_col="lastserviced_changed", window=window
+            ).fillna(0)
         )
         f[f"route_services_{window}h"] = (
-            f.groupby([EVENT, "snowrouteid"], group_keys=False)
-            .apply(rolling_sum, value_col="lastserviced_changed", window=window)
-            .fillna(0)
+            group_apply_no_groups(
+                f,
+                [EVENT, "snowrouteid"],
+                rolling_sum,
+                value_col="lastserviced_changed",
+                window=window,
+            ).fillna(0)
         )
 
-        seg_roll = (
-            f.groupby([EVENT, SEG], group_keys=False)
-            .apply(
-                rolling_delta_ratio,
-                value_col="passes_event",
-                window=window,
-                prefix="passes_event",
-            )
-            .fillna(0)
-        )
+        seg_roll = group_apply_no_groups(
+            f,
+            [EVENT, SEG],
+            rolling_delta_ratio,
+            value_col="passes_event",
+            window=window,
+            prefix="passes_event",
+        ).fillna(0)
         f = f.join(seg_roll)
 
-        route_roll = (
-            f.groupby([EVENT, "snowrouteid"], group_keys=False)
-            .apply(
-                rolling_delta_ratio,
-                value_col="passes_event",
-                window=window,
-                prefix="route_passes_event",
-            )
-            .fillna(0)
-        )
+        route_roll = group_apply_no_groups(
+            f,
+            [EVENT, "snowrouteid"],
+            rolling_delta_ratio,
+            value_col="passes_event",
+            window=window,
+            prefix="route_passes_event",
+        ).fillna(0)
         f = f.join(route_roll)
 
     if neighbor_lookup:
@@ -646,7 +653,7 @@ def train_eta_regression(
     preds = reg.predict(X[test_idx])
     y_true = df.loc[test_idx, "hours_to_next_service"]
     metrics["mae"] = float(mean_absolute_error(y_true, preds))
-    metrics["rmse"] = float(mean_squared_error(y_true, preds, squared=False))
+    metrics["rmse"] = float(np.sqrt(mean_squared_error(y_true, preds)))
 
     prob_df = pd.DataFrame(index=df.loc[test_idx].index)
     for h in HORIZONS:
@@ -662,7 +669,7 @@ def train_eta_regression(
         eta_pred = eta_series[valid_eta]
         metrics["eta_class_mae"] = float(mean_absolute_error(eta_true, eta_pred))
         metrics["eta_class_rmse"] = float(
-            mean_squared_error(eta_true, eta_pred, squared=False)
+            np.sqrt(mean_squared_error(eta_true, eta_pred))
         )
 
     return reg, metrics
@@ -753,8 +760,8 @@ def train_models(
         models[h] = clf
 
         if not X_calib.empty and y_calib.nunique() >= 2:
-            calibrator = CalibratedClassifierCV(clf, cv="prefit", method="sigmoid")
-            calibrator.fit(X_calib, y_calib)
+            calibrator = CalibratedClassifierCV(clf, cv=5, method="sigmoid")
+            calibrator.fit(X_train, y_train)
             calibrated[h] = calibrator
         else:
             calibrated[h] = None
@@ -990,11 +997,10 @@ def main() -> None:
         return
 
     geo_df = load_geojson_features(GEOJSON_PATH)
-    if not geo_df.empty:
-        snapshots = snapshots.merge(
-            geo_df[[SEG, EVENT, "passes_phase"]], on=[SEG, EVENT], how="left"
+    if "passes_phase" in snapshots.columns:
+        snapshots["passes_event"] = snapshots["passes_phase"].fillna(
+            snapshots["passes"]
         )
-        snapshots["passes_event"] = snapshots["passes_phase"].fillna(snapshots["passes"])
     else:
         snapshots["passes_event"] = snapshots["passes"]
 
