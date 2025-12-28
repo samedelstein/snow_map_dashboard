@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import brier_score_loss, roc_auc_score
+from sklearn.model_selection import GroupKFold
 from sklearn.neighbors import BallTree
 
 # -----------------------------
@@ -241,19 +242,23 @@ def add_horizon_labels(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 def train_models(
     df: pd.DataFrame, features: list[str]
-) -> tuple[dict[int, HistGradientBoostingClassifier | None], dict[int, dict], pd.Series]:
+) -> tuple[
+    dict[int, HistGradientBoostingClassifier | None],
+    dict[str, dict[int, dict]],
+    pd.Series,
+]:
     if df.empty:
         return {}, {}, pd.Series(dtype=float)
 
-    cutoff = df[TS].quantile(0.8)
-    train_mask = df[TS] <= cutoff
+    train_cutoffs = df.groupby(EVENT)[TS].transform(lambda s: s.quantile(0.8))
+    train_mask = df[TS] <= train_cutoffs
 
     X = df[features].replace([np.inf, -np.inf], np.nan)
     medians = X.median(numeric_only=True)
     X = X.fillna(medians)
 
     models: dict[int, HistGradientBoostingClassifier | None] = {}
-    metrics: dict[int, dict] = {}
+    metrics: dict[str, dict[int, dict]] = {"within_event_time": {}, "groupkfold_event": {}}
 
     for h in HORIZONS:
         y = df[f"y_{h}h"].astype(int)
@@ -262,12 +267,12 @@ def train_models(
 
         if X_train.empty or y_train.nunique() < 2:
             models[h] = None
-            metrics[h] = {
+            metrics["within_event_time"][h] = {
                 "rows_train": int(X_train.shape[0]),
                 "rows_test": int(X_test.shape[0]),
                 "auc": None,
                 "brier": None,
-                "cutoff_utc": str(cutoff),
+                "event_count": int(df[EVENT].nunique()),
                 "note": "insufficient training data",
             }
             continue
@@ -289,12 +294,69 @@ def train_models(
             auc = float(roc_auc_score(y_test, p))
             brier = float(brier_score_loss(y_test, p))
 
-        metrics[h] = {
+        metrics["within_event_time"][h] = {
             "rows_train": int(X_train.shape[0]),
             "rows_test": int(X_test.shape[0]),
             "auc": auc,
             "brier": brier,
-            "cutoff_utc": str(cutoff),
+            "event_count": int(df[EVENT].nunique()),
+            "train_ratio": float(train_mask.mean()),
+        }
+
+    n_events = int(df[EVENT].nunique())
+    if n_events < 2:
+        for h in HORIZONS:
+            metrics["groupkfold_event"][h] = {
+                "rows_train": int(df.shape[0]),
+                "rows_test": 0,
+                "auc": None,
+                "brier": None,
+                "event_count": n_events,
+                "folds": 0,
+                "note": "insufficient training data",
+            }
+        return models, metrics, medians
+
+    n_splits = min(5, n_events)
+    gkf = GroupKFold(n_splits=n_splits)
+    groups = df[EVENT]
+
+    for h in HORIZONS:
+        y = df[f"y_{h}h"].astype(int)
+        aucs: list[float] = []
+        briers: list[float] = []
+        rows_train = 0
+        rows_test = 0
+        folds = 0
+
+        for train_idx, test_idx in gkf.split(X, y, groups):
+            X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+            X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
+            rows_train += int(X_train.shape[0])
+            rows_test += int(X_test.shape[0])
+
+            if X_train.empty or y_train.nunique() < 2 or y_test.nunique() < 2:
+                continue
+
+            clf = HistGradientBoostingClassifier(
+                max_depth=6,
+                learning_rate=0.08,
+                max_iter=350,
+                random_state=42,
+            )
+            clf.fit(X_train, y_train)
+            p = clf.predict_proba(X_test)[:, 1]
+            aucs.append(float(roc_auc_score(y_test, p)))
+            briers.append(float(brier_score_loss(y_test, p)))
+            folds += 1
+
+        metrics["groupkfold_event"][h] = {
+            "rows_train": rows_train,
+            "rows_test": rows_test,
+            "auc": float(np.mean(aucs)) if aucs else None,
+            "brier": float(np.mean(briers)) if briers else None,
+            "event_count": n_events,
+            "folds": folds,
         }
 
     return models, metrics, medians
