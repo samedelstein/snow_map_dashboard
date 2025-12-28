@@ -30,7 +30,7 @@ jobs:
           ls -la snapshot_snow_routes
 
       - name: Run snapshot script
-        run: python snapshot_snow_routes/snapshot_snow_routes.py
+        run: python -m snow_map_dashboard.snapshot
 
       - name: Debug - show output mtimes
         run: |
@@ -51,4 +51,3 @@ jobs:
 
           git commit -m "snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || exit 0
           git push
-
