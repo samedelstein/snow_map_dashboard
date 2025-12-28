@@ -34,8 +34,8 @@ jobs:
 
       - name: Debug - show output mtimes
         run: |
-          ls -la snapshot_snow_routes/latest_routes.geojson snapshot_snow_routes/snapshots.csv snapshot_snow_routes/state.json
-          tail -n 2 snapshot_snow_routes/snapshots.csv
+          ls -la snapshot_snow_routes/output/latest_routes.geojson snapshot_snow_routes/output/snapshots.csv snapshot_snow_routes/output/state.json
+          tail -n 2 snapshot_snow_routes/output/snapshots.csv
 
 
       - name: Commit and push changes
@@ -45,10 +45,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git status --porcelain
-          git add snapshot_snow_routes/latest_routes.geojson snapshot_snow_routes/snapshots.csv snapshot_snow_routes/state.json
+          git add snapshot_snow_routes/output/latest_routes.geojson snapshot_snow_routes/output/snapshots.csv snapshot_snow_routes/output/state.json
           git status --porcelain
           git diff --cached --name-status
 
           git commit -m "snapshot: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || exit 0
           git push
-

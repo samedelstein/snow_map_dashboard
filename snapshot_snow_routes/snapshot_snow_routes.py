@@ -13,9 +13,10 @@ BASE_QUERY_URL = (
 )
 
 PAGE_SIZE = 2000  # layer maxRecordCount
-STATE_PATH = "snapshot_snow_routes/state.json"
-LATEST_GEOJSON_PATH = "snapshot_snow_routes/latest_routes.geojson"
-SNAPSHOTS_CSV_PATH = "snapshot_snow_routes/snapshots.csv"
+OUTPUT_DIR = "snapshot_snow_routes/output"
+STATE_PATH = os.path.join(OUTPUT_DIR, "state.json")
+LATEST_GEOJSON_PATH = os.path.join(OUTPUT_DIR, "latest_routes.geojson")
+SNAPSHOTS_CSV_PATH = os.path.join(OUTPUT_DIR, "snapshots.csv")
 
 # Only changes to these fields create a new historical row.
 CHANGE_FIELDS = [
@@ -130,6 +131,7 @@ def esri_features_to_geojson_featurecollection(esri_features):
 
 
 def write_latest_geojson(fc, path=LATEST_GEOJSON_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(fc, f)
 
@@ -142,6 +144,7 @@ def load_state(path=STATE_PATH):
 
 
 def save_state(state, path=STATE_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f)
@@ -166,6 +169,7 @@ def append_changed_rows_from_geojson(fc, state, csv_path=SNAPSHOTS_CSV_PATH):
     file_exists = os.path.exists(csv_path)
     changed_count = 0
 
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         if not file_exists:
