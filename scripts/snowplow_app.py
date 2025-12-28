@@ -22,12 +22,15 @@ BASE_URL = (
     "Winter_Operations_Snow_Routes/FeatureServer/0/query"
 )
 
-REPO_ROOT = Path(__file__).resolve().parent
-ARTIFACT_DIR = REPO_ROOT / "artifacts_snow"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+ARTIFACT_DIR = DATA_DIR / "artifacts_snow"
 PRED_PATH = ARTIFACT_DIR / "predictions_latest_prob.csv"
 METRICS_PATH = ARTIFACT_DIR / "model_metrics_prob.json"
-GEOJSON_PATH = REPO_ROOT / "snapshot_snow_routes/latest_routes.geojson"  # updated by snapshot_snow_routes/snapshot_snow_routes.py
-SNAPSHOT_PATH = REPO_ROOT / "snapshot_snow_routes" / "snapshots.csv"
+GEOJSON_PATH = (
+    DATA_DIR / "snapshot_snow_routes/latest_routes.geojson"
+)  # updated by scripts/snapshot_snow_routes.py
+SNAPSHOT_PATH = DATA_DIR / "snapshot_snow_routes" / "snapshots.csv"
 
 DEFAULT_CUTOFF_DATE_STR = "2025-12-01"  # UTC cutoff for "this storm"
 DEFAULT_PAGE_SIZE = 2000
@@ -474,7 +477,9 @@ with tab_pred:
     geojson_obj = load_geojson()
 
     if preds.empty:
-        st.warning("No predictions file found. Expected at: artifacts_snow/predictions_latest_prob.csv")
+        st.warning(
+            "No predictions file found. Expected at: data/artifacts_snow/predictions_latest_prob.csv"
+        )
         st.stop()
 
     # Human-friendly event selector

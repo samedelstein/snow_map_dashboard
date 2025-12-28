@@ -29,15 +29,15 @@ jobs:
 
       - name: Debug - list snapshot folder
         run: |
-          ls -la snapshot_snow_routes
+          ls -la data/snapshot_snow_routes
 
       - name: Run snapshot script
         run: python -m snow_map_dashboard.snapshot
 
       - name: Debug - show output mtimes
         run: |
-          ls -la snapshot_snow_routes/latest_routes.geojson snapshot_snow_routes/snapshots.csv snapshot_snow_routes/state.json
-          tail -n 2 snapshot_snow_routes/snapshots.csv
+          ls -la data/snapshot_snow_routes/latest_routes.geojson data/snapshot_snow_routes/snapshots.csv data/snapshot_snow_routes/state.json
+          tail -n 2 data/snapshot_snow_routes/snapshots.csv
 
 
       - name: Commit and push changes
@@ -49,7 +49,7 @@ jobs:
           git pull --rebase origin main
 
           git status --porcelain
-          git add snapshot_snow_routes/latest_routes.geojson snapshot_snow_routes/snapshots.csv snapshot_snow_routes/state.json
+          git add data/snapshot_snow_routes/latest_routes.geojson data/snapshot_snow_routes/snapshots.csv data/snapshot_snow_routes/state.json
           git status --porcelain
           git diff --cached --name-status
 

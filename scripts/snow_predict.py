@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -30,12 +31,14 @@ from sklearn.neighbors import BallTree
 # -----------------------------
 # Config (defaults to local snapshot/geojson files)
 # -----------------------------
-SNAPSHOT_PATH = "snapshot_snow_routes/snapshots.csv"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+SNAPSHOT_PATH = str(DATA_DIR / "snapshot_snow_routes" / "snapshots.csv")
 REMOTE_SNAPSHOT_URL = (
     "https://raw.githubusercontent.com/samedelstein/snow_map_dashboard/"
-    "refs/heads/main/snapshot_snow_routes/snapshots.csv"
+    "refs/heads/main/data/snapshot_snow_routes/snapshots.csv"
 )
-GEOJSON_PATH = "winter_operations_snow_routes_layer0.geojson"
+GEOJSON_PATH = str(REPO_ROOT / "winter_operations_snow_routes_layer0.geojson")
 
 EVENT = "eventid"
 SEG = "snowroutesegmentid"
@@ -43,9 +46,9 @@ TS = "snapshot_ts"
 
 HORIZONS = [1, 2, 4, 8]
 ETA_THRESHOLD = 0.60
-ARTIFACT_DIR = "artifacts_snow"
-os.makedirs(ARTIFACT_DIR, exist_ok=True)
-ALERT_LOG_PATH = os.path.join(ARTIFACT_DIR, "nws_alerts_log.csv")
+ARTIFACT_DIR = DATA_DIR / "artifacts_snow"
+ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+ALERT_LOG_PATH = str(ARTIFACT_DIR / "nws_alerts_log.csv")
 
 NOAA_STATION_ID = "KSYR"
 NWS_POINT = "43.0481,-76.1474"
@@ -1062,21 +1065,21 @@ def main() -> None:
     pred_latest = predict_latest(
         featured, models, calibrated, medians, feature_cols, reg_model
     )
-    pred_path = os.path.join(ARTIFACT_DIR, "predictions_latest_prob.csv")
+    pred_path = ARTIFACT_DIR / "predictions_latest_prob.csv"
     pred_latest.to_csv(pred_path, index=False)
 
-    metrics_path = os.path.join(ARTIFACT_DIR, "model_metrics_prob.json")
+    metrics_path = ARTIFACT_DIR / "model_metrics_prob.json"
     metrics["feature_importance_path"] = os.path.join(
-        ARTIFACT_DIR, "feature_importance.json"
+        ARTIFACT_DIR / "feature_importance.json"
     )
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    feature_path = os.path.join(ARTIFACT_DIR, "feature_importance.json")
+    feature_path = ARTIFACT_DIR / "feature_importance.json"
     with open(feature_path, "w", encoding="utf-8") as f:
         json.dump(feature_importance, f, indent=2)
 
-    weather_path = os.path.join(ARTIFACT_DIR, "weather_data_sources.json")
+    weather_path = ARTIFACT_DIR / "weather_data_sources.json"
     with open(weather_path, "w", encoding="utf-8") as f:
         json.dump(
             {
