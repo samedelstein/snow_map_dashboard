@@ -1,0 +1,1 @@
+"""Snow map dashboard package."""
