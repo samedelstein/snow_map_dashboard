@@ -14,8 +14,16 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import requests
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import brier_score_loss, roc_auc_score
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    mean_absolute_error,
+    mean_squared_error,
+    roc_auc_score,
+)
 from sklearn.model_selection import GroupKFold
 from sklearn.neighbors import BallTree
 
@@ -218,6 +226,13 @@ def build_weather_features(
         & (present.str.contains("fzra") | desc.str.contains("freezing"))
     ).astype(int)
 
+    hourly = hourly.sort_values("hour_bucket").copy()
+    for lag in [1, 2, 3]:
+        hourly[f"temp_c_lag{lag}"] = hourly["temp_c"].shift(lag)
+        hourly[f"snowfall_rate_mmhr_lag{lag}"] = hourly["snowfall_rate_mmhr"].shift(lag)
+        hourly[f"wind_speed_mps_lag{lag}"] = hourly["wind_speed_mps"].shift(lag)
+        hourly[f"wind_gust_mps_lag{lag}"] = hourly["wind_gust_mps"].shift(lag)
+
     weather_meta = {
         "station_id": NOAA_STATION_ID,
         "observations": {
@@ -236,6 +251,18 @@ def build_weather_features(
                 "wind_gust_mps",
                 "snowfall_rate_mmhr",
                 "freezing_rain",
+                "temp_c_lag1",
+                "temp_c_lag2",
+                "temp_c_lag3",
+                "snowfall_rate_mmhr_lag1",
+                "snowfall_rate_mmhr_lag2",
+                "snowfall_rate_mmhr_lag3",
+                "wind_speed_mps_lag1",
+                "wind_speed_mps_lag2",
+                "wind_speed_mps_lag3",
+                "wind_gust_mps_lag1",
+                "wind_gust_mps_lag2",
+                "wind_gust_mps_lag3",
             ]
         ],
         weather_meta,
@@ -392,6 +419,66 @@ def add_features(
     f = f.merge(route, on=[EVENT, "snowrouteid", "hour_bucket"], how="left")
     f["route_services_last_hour"] = f["route_services_last_hour"].fillna(0)
 
+    def rolling_sum(group: pd.DataFrame, value_col: str, window: int) -> pd.Series:
+        g = group.sort_values("hour_bucket")
+        series = g.set_index("hour_bucket")[value_col]
+        rolled = series.rolling(f"{window}h", min_periods=1).sum()
+        rolled.index = g.index
+        return rolled
+
+    def rolling_delta_ratio(
+        group: pd.DataFrame, value_col: str, window: int, prefix: str
+    ) -> pd.DataFrame:
+        g = group.sort_values("hour_bucket")
+        series = g.set_index("hour_bucket")[value_col]
+        rolling_min = series.rolling(f"{window}h", min_periods=1).min()
+        rolling_max = series.rolling(f"{window}h", min_periods=1).max()
+        delta = (rolling_max - rolling_min).to_numpy()
+        ratio = (rolling_max / rolling_min.replace(0, np.nan)).to_numpy()
+        return pd.DataFrame(
+            {
+                f"{prefix}_delta_{window}h": delta,
+                f"{prefix}_ratio_{window}h": ratio,
+            },
+            index=g.index,
+        )
+
+    for window in [3, 6]:
+        f[f"seg_services_{window}h"] = (
+            f.groupby([EVENT, SEG], group_keys=False)
+            .apply(rolling_sum, value_col="lastserviced_changed", window=window)
+            .fillna(0)
+        )
+        f[f"route_services_{window}h"] = (
+            f.groupby([EVENT, "snowrouteid"], group_keys=False)
+            .apply(rolling_sum, value_col="lastserviced_changed", window=window)
+            .fillna(0)
+        )
+
+        seg_roll = (
+            f.groupby([EVENT, SEG], group_keys=False)
+            .apply(
+                rolling_delta_ratio,
+                value_col="passes_event",
+                window=window,
+                prefix="passes_event",
+            )
+            .fillna(0)
+        )
+        f = f.join(seg_roll)
+
+        route_roll = (
+            f.groupby([EVENT, "snowrouteid"], group_keys=False)
+            .apply(
+                rolling_delta_ratio,
+                value_col="passes_event",
+                window=window,
+                prefix="route_passes_event",
+            )
+            .fillna(0)
+        )
+        f = f.join(route_roll)
+
     if neighbor_lookup:
         seg_hour = (
             f.groupby([EVENT, SEG, "hour_bucket"])["lastserviced_changed"]
@@ -417,6 +504,11 @@ def add_features(
         f["wind_gust_mps"] = np.nan
         f["snowfall_rate_mmhr"] = np.nan
         f["freezing_rain"] = 0
+        for lag in [1, 2, 3]:
+            f[f"temp_c_lag{lag}"] = np.nan
+            f[f"snowfall_rate_mmhr_lag{lag}"] = np.nan
+            f[f"wind_speed_mps_lag{lag}"] = np.nan
+            f[f"wind_gust_mps_lag{lag}"] = np.nan
 
     if alerts_hourly is not None and not alerts_hourly.empty:
         f = f.merge(alerts_hourly, on="hour_bucket", how="left")
@@ -451,6 +543,89 @@ def add_horizon_labels(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def expected_calibration_error(
+    y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10
+) -> float:
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_ids = np.digitize(y_prob, bins) - 1
+    ece = 0.0
+    for i in range(n_bins):
+        mask = bin_ids == i
+        if not np.any(mask):
+            continue
+        bin_acc = y_true[mask].mean()
+        bin_conf = y_prob[mask].mean()
+        ece += np.abs(bin_acc - bin_conf) * (mask.sum() / len(y_true))
+    return float(ece)
+
+
+def derive_eta_from_probs(prob_df: pd.DataFrame) -> pd.Series:
+    def eta(row: pd.Series) -> float:
+        for h in HORIZONS:
+            if row.get(f"p_{h}h", np.nan) >= ETA_THRESHOLD:
+                return float(h)
+        return np.nan
+
+    return prob_df.apply(eta, axis=1)
+
+
+def train_eta_regression(
+    df: pd.DataFrame,
+    X: pd.DataFrame,
+    train_mask: pd.Series,
+    models: dict[int, HistGradientBoostingClassifier | None],
+    calibrated: dict[int, CalibratedClassifierCV | None],
+) -> tuple[HistGradientBoostingRegressor | None, dict[str, Any]]:
+    valid = df["hours_to_next_service"].notna()
+    train_idx = train_mask & valid
+    test_idx = (~train_mask) & valid
+
+    metrics: dict[str, Any] = {
+        "rows_train": int(train_idx.sum()),
+        "rows_test": int(test_idx.sum()),
+        "mae": None,
+        "rmse": None,
+        "eta_class_mae": None,
+        "eta_class_rmse": None,
+    }
+
+    if train_idx.sum() < 10 or test_idx.sum() == 0:
+        metrics["note"] = "insufficient training data"
+        return None, metrics
+
+    reg = HistGradientBoostingRegressor(
+        max_depth=6,
+        learning_rate=0.08,
+        max_iter=350,
+        random_state=42,
+    )
+    reg.fit(X[train_idx], df.loc[train_idx, "hours_to_next_service"])
+
+    preds = reg.predict(X[test_idx])
+    y_true = df.loc[test_idx, "hours_to_next_service"]
+    metrics["mae"] = float(mean_absolute_error(y_true, preds))
+    metrics["rmse"] = float(mean_squared_error(y_true, preds, squared=False))
+
+    prob_df = pd.DataFrame(index=df.loc[test_idx].index)
+    for h in HORIZONS:
+        model = calibrated.get(h) or models.get(h)
+        if model is None:
+            prob_df[f"p_{h}h"] = np.nan
+        else:
+            prob_df[f"p_{h}h"] = model.predict_proba(X[test_idx])[:, 1]
+    eta_series = derive_eta_from_probs(prob_df)
+    valid_eta = eta_series.notna()
+    if valid_eta.any():
+        eta_true = y_true[valid_eta]
+        eta_pred = eta_series[valid_eta]
+        metrics["eta_class_mae"] = float(mean_absolute_error(eta_true, eta_pred))
+        metrics["eta_class_rmse"] = float(
+            mean_squared_error(eta_true, eta_pred, squared=False)
+        )
+
+    return reg, metrics
+
+
 # -----------------------------
 # Train models
 # -----------------------------
@@ -458,11 +633,14 @@ def train_models(
     df: pd.DataFrame, features: list[str]
 ) -> tuple[
     dict[int, HistGradientBoostingClassifier | None],
+    dict[int, CalibratedClassifierCV | None],
     dict[str, dict[int, dict]],
     pd.Series,
+    HistGradientBoostingRegressor | None,
+    dict[int, list[dict[str, float]]],
 ]:
     if df.empty:
-        return {}, {}, pd.Series(dtype=float)
+        return {}, {}, {}, pd.Series(dtype=float), None, {}
 
     train_cutoffs = df.groupby(EVENT)[TS].transform(lambda s: s.quantile(0.8))
     train_mask = df[TS] <= train_cutoffs
@@ -472,24 +650,56 @@ def train_models(
     X = X.fillna(medians)
 
     models: dict[int, HistGradientBoostingClassifier | None] = {}
-    metrics: dict[str, dict[int, dict]] = {"within_event_time": {}, "groupkfold_event": {}}
+    calibrated: dict[int, CalibratedClassifierCV | None] = {}
+    metrics: dict[str, dict[int, dict]] = {
+        "within_event_time": {},
+        "groupkfold_event": {},
+        "calibration": {},
+    }
+    feature_importance: dict[int, list[dict[str, float]]] = {}
+
+    calib_cutoffs = df.loc[train_mask].groupby(EVENT)[TS].transform(
+        lambda s: s.quantile(0.8)
+    )
+    calib_mask = pd.Series(False, index=df.index)
+    calib_mask.loc[train_mask] = df.loc[train_mask, TS] > calib_cutoffs
+    base_train_mask = train_mask & ~calib_mask
 
     for h in HORIZONS:
         y = df[f"y_{h}h"].astype(int)
-        X_train, y_train = X[train_mask], y[train_mask]
+        X_train, y_train = X[base_train_mask], y[base_train_mask]
+        X_calib, y_calib = X[calib_mask], y[calib_mask]
         X_test, y_test = X[~train_mask], y[~train_mask]
 
         if X_train.empty or y_train.nunique() < 2:
             models[h] = None
+            calibrated[h] = None
             metrics["within_event_time"][h] = {
                 "rows_train": int(X_train.shape[0]),
                 "rows_test": int(X_test.shape[0]),
                 "auc": None,
                 "brier": None,
+                "pr_auc": None,
                 "event_count": int(df[EVENT].nunique()),
                 "note": "insufficient training data",
             }
+            metrics["calibration"][h] = {
+                "rows": int(X_calib.shape[0]),
+                "brier": None,
+                "ece": None,
+            }
             continue
+
+        pos = y_train.sum()
+        neg = len(y_train) - pos
+        pos_rate = float(pos / len(y_train)) if len(y_train) else 0.0
+        if pos > 0 and neg > 0 and (pos_rate < 0.2 or pos_rate > 0.8):
+            pos_weight = neg / pos
+            sample_weight = np.where(y_train == 1, pos_weight, 1.0)
+            class_strategy = "weighted"
+        else:
+            sample_weight = None
+            class_strategy = "none"
 
         clf = HistGradientBoostingClassifier(
             max_depth=6,
@@ -497,25 +707,77 @@ def train_models(
             max_iter=350,
             random_state=42,
         )
-        clf.fit(X_train, y_train)
+        clf.fit(X_train, y_train, sample_weight=sample_weight)
         models[h] = clf
+
+        if not X_calib.empty and y_calib.nunique() >= 2:
+            calibrator = CalibratedClassifierCV(clf, cv="prefit", method="sigmoid")
+            calibrator.fit(X_calib, y_calib)
+            calibrated[h] = calibrator
+        else:
+            calibrated[h] = None
 
         if X_test.empty or y_test.nunique() < 2:
             auc = None
             brier = None
+            pr_auc = None
         else:
-            p = clf.predict_proba(X_test)[:, 1]
+            model_for_eval = calibrated[h] or clf
+            p = model_for_eval.predict_proba(X_test)[:, 1]
             auc = float(roc_auc_score(y_test, p))
             brier = float(brier_score_loss(y_test, p))
+            pr_auc = float(average_precision_score(y_test, p))
 
         metrics["within_event_time"][h] = {
             "rows_train": int(X_train.shape[0]),
             "rows_test": int(X_test.shape[0]),
             "auc": auc,
             "brier": brier,
+            "pr_auc": pr_auc,
             "event_count": int(df[EVENT].nunique()),
             "train_ratio": float(train_mask.mean()),
+            "pos_rate_train": pos_rate,
+            "class_strategy": class_strategy,
         }
+
+        if calibrated[h] is not None and not X_calib.empty and y_calib.nunique() >= 2:
+            p_calib = calibrated[h].predict_proba(X_calib)[:, 1]
+            metrics["calibration"][h] = {
+                "rows": int(X_calib.shape[0]),
+                "brier": float(brier_score_loss(y_calib, p_calib)),
+                "ece": expected_calibration_error(
+                    y_calib.to_numpy(), p_calib
+                ),
+            }
+        else:
+            metrics["calibration"][h] = {
+                "rows": int(X_calib.shape[0]),
+                "brier": None,
+                "ece": None,
+            }
+
+        if not X_test.empty and y_test.nunique() >= 2:
+            perm = permutation_importance(
+                clf,
+                X_test,
+                y_test,
+                n_repeats=10,
+                random_state=42,
+                scoring="roc_auc",
+            )
+            ranked = sorted(
+                [
+                    {
+                        "feature": features[i],
+                        "importance_mean": float(perm.importances_mean[i]),
+                        "importance_std": float(perm.importances_std[i]),
+                    }
+                    for i in range(len(features))
+                ],
+                key=lambda x: x["importance_mean"],
+                reverse=True,
+            )
+            feature_importance[h] = ranked
 
     n_events = int(df[EVENT].nunique())
     if n_events < 2:
@@ -525,11 +787,16 @@ def train_models(
                 "rows_test": 0,
                 "auc": None,
                 "brier": None,
+                "pr_auc": None,
                 "event_count": n_events,
                 "folds": 0,
                 "note": "insufficient training data",
             }
-        return models, metrics, medians
+        reg_model, reg_metrics = train_eta_regression(
+            df, X, train_mask, models, calibrated
+        )
+        metrics["eta_regression"] = reg_metrics
+        return models, calibrated, metrics, medians, reg_model, feature_importance
 
     n_splits = min(5, n_events)
     gkf = GroupKFold(n_splits=n_splits)
@@ -539,6 +806,7 @@ def train_models(
         y = df[f"y_{h}h"].astype(int)
         aucs: list[float] = []
         briers: list[float] = []
+        pr_aucs: list[float] = []
         rows_train = 0
         rows_test = 0
         folds = 0
@@ -552,16 +820,26 @@ def train_models(
             if X_train.empty or y_train.nunique() < 2 or y_test.nunique() < 2:
                 continue
 
+            pos = y_train.sum()
+            neg = len(y_train) - pos
+            pos_rate = float(pos / len(y_train)) if len(y_train) else 0.0
+            if pos > 0 and neg > 0 and (pos_rate < 0.2 or pos_rate > 0.8):
+                pos_weight = neg / pos
+                sample_weight = np.where(y_train == 1, pos_weight, 1.0)
+            else:
+                sample_weight = None
+
             clf = HistGradientBoostingClassifier(
                 max_depth=6,
                 learning_rate=0.08,
                 max_iter=350,
                 random_state=42,
             )
-            clf.fit(X_train, y_train)
+            clf.fit(X_train, y_train, sample_weight=sample_weight)
             p = clf.predict_proba(X_test)[:, 1]
             aucs.append(float(roc_auc_score(y_test, p)))
             briers.append(float(brier_score_loss(y_test, p)))
+            pr_aucs.append(float(average_precision_score(y_test, p)))
             folds += 1
 
         metrics["groupkfold_event"][h] = {
@@ -569,11 +847,17 @@ def train_models(
             "rows_test": rows_test,
             "auc": float(np.mean(aucs)) if aucs else None,
             "brier": float(np.mean(briers)) if briers else None,
+            "pr_auc": float(np.mean(pr_aucs)) if pr_aucs else None,
             "event_count": n_events,
             "folds": folds,
         }
 
-    return models, metrics, medians
+    reg_model, reg_metrics = train_eta_regression(
+        df, X, train_mask, models, calibrated
+    )
+    metrics["eta_regression"] = reg_metrics
+
+    return models, calibrated, metrics, medians, reg_model, feature_importance
 
 
 # -----------------------------
@@ -582,8 +866,10 @@ def train_models(
 def predict_latest(
     df: pd.DataFrame,
     models: dict[int, HistGradientBoostingClassifier | None],
+    calibrated: dict[int, CalibratedClassifierCV | None],
     medians: pd.Series,
     features: list[str],
+    reg_model: HistGradientBoostingRegressor | None,
 ) -> pd.DataFrame:
     latest = (
         df.sort_values([EVENT, SEG, TS])
@@ -602,7 +888,7 @@ def predict_latest(
         X_now = X_now.fillna(0)
 
     for h in HORIZONS:
-        model = models.get(h)
+        model = calibrated.get(h) or models.get(h)
         if model is None:
             latest[f"p_{h}h"] = np.nan
         else:
@@ -612,19 +898,19 @@ def predict_latest(
     latest["p_4h"] = latest[["p_2h", "p_4h"]].max(axis=1)
     latest["p_8h"] = latest[["p_4h", "p_8h"]].max(axis=1)
 
-    def eta(row: pd.Series) -> float:
-        for h in HORIZONS:
-            if row.get(f"p_{h}h", np.nan) >= ETA_THRESHOLD:
-                return float(h)
-        return np.nan
-
-    latest["eta_hours_60"] = latest.apply(eta, axis=1)
+    latest["eta_hours_60"] = derive_eta_from_probs(latest)
     latest["eta_ts_60"] = latest[TS] + pd.to_timedelta(latest["eta_hours_60"], unit="h")
+
+    if reg_model is not None:
+        latest["eta_hours_pred"] = reg_model.predict(X_now)
+    else:
+        latest["eta_hours_pred"] = np.nan
 
     for h in HORIZONS:
         latest.loc[latest["prediction_status"] != "OK", f"p_{h}h"] = np.nan
     latest.loc[
-        latest["prediction_status"] != "OK", ["eta_hours_60", "eta_ts_60"]
+        latest["prediction_status"] != "OK",
+        ["eta_hours_60", "eta_ts_60", "eta_hours_pred"],
     ] = np.nan
 
     return latest
@@ -692,26 +978,61 @@ def main() -> None:
         "dow",
         "city_services_last_hour",
         "route_services_last_hour",
+        "seg_services_3h",
+        "seg_services_6h",
+        "route_services_3h",
+        "route_services_6h",
+        "passes_event_delta_3h",
+        "passes_event_ratio_3h",
+        "passes_event_delta_6h",
+        "passes_event_ratio_6h",
+        "route_passes_event_delta_3h",
+        "route_passes_event_ratio_3h",
+        "route_passes_event_delta_6h",
+        "route_passes_event_ratio_6h",
         "neighbor_services_last_hour",
         "temp_c",
         "wind_speed_mps",
         "wind_gust_mps",
         "snowfall_rate_mmhr",
         "freezing_rain",
+        "temp_c_lag1",
+        "temp_c_lag2",
+        "temp_c_lag3",
+        "snowfall_rate_mmhr_lag1",
+        "snowfall_rate_mmhr_lag2",
+        "snowfall_rate_mmhr_lag3",
+        "wind_speed_mps_lag1",
+        "wind_speed_mps_lag2",
+        "wind_speed_mps_lag3",
+        "wind_gust_mps_lag1",
+        "wind_gust_mps_lag2",
+        "wind_gust_mps_lag3",
         "nws_alert_count",
         "nws_alert_active",
     ]
 
     train_df = featured[featured["prediction_status"] == "OK"].copy()
-    models, metrics, medians = train_models(train_df, feature_cols)
+    models, calibrated, metrics, medians, reg_model, feature_importance = train_models(
+        train_df, feature_cols
+    )
 
-    pred_latest = predict_latest(featured, models, medians, feature_cols)
+    pred_latest = predict_latest(
+        featured, models, calibrated, medians, feature_cols, reg_model
+    )
     pred_path = os.path.join(ARTIFACT_DIR, "predictions_latest_prob.csv")
     pred_latest.to_csv(pred_path, index=False)
 
     metrics_path = os.path.join(ARTIFACT_DIR, "model_metrics_prob.json")
+    metrics["feature_importance_path"] = os.path.join(
+        ARTIFACT_DIR, "feature_importance.json"
+    )
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+
+    feature_path = os.path.join(ARTIFACT_DIR, "feature_importance.json")
+    with open(feature_path, "w", encoding="utf-8") as f:
+        json.dump(feature_importance, f, indent=2)
 
     weather_path = os.path.join(ARTIFACT_DIR, "weather_data_sources.json")
     with open(weather_path, "w", encoding="utf-8") as f:
