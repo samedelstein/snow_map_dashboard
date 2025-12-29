@@ -368,6 +368,12 @@ def attach_predictions_to_geojson(geojson_obj: dict, preds: pd.DataFrame, eventi
             else:
                 props["_line_color"] = prob_to_color(row.get(color_by))
 
+        props["route_label"] = format_route_label(props.get("snowrouteid"))
+        props["p_1h_pct"] = format_probability(props.get("p_1h"))
+        props["p_2h_pct"] = format_probability(props.get("p_2h"))
+        props["p_4h_pct"] = format_probability(props.get("p_4h"))
+        props["p_8h_pct"] = format_probability(props.get("p_8h"))
+        props["eta_60_label"] = format_eta_hours(props.get("eta_hours_60"))
         feat["properties"] = props
 
     return geojson_obj
@@ -657,18 +663,18 @@ with tab_live:
             initial_view_state=view_state,
             tooltip={
                 "text": (
-                    "Road: {roadname}\n"
-                    "Priority: {routepriority}\n"
-                    "Route: {route_label}\n"
-                    "Status: {servicestatus}\n"
-                    "Bucket: {bucket}\n"
-                    "Miles: {miles:.3f}\n"
-                    "Last serviced: {lastserviced_dt}\n"
-                    "Plow likelihood (next hour): {p_1h_pct}\n"
-                    "Plow likelihood (next 2 hours): {p_2h_pct}\n"
-                    "Plow likelihood (next 4 hours): {p_4h_pct}\n"
-                    "Plow likelihood (next 8 hours): {p_8h_pct}\n"
-                    "ETA at 60% likelihood: {eta_60_label}"
+                    "Road name: {roadname}\n"
+                    "Priority level: {routepriority}\n"
+                    "Route label: {route_label}\n"
+                    "Current status: {servicestatus}\n"
+                    "Time-since-plow bucket: {bucket}\n"
+                    "Segment length (miles): {miles:.3f}\n"
+                    "Last plowed at: {lastserviced_dt}\n"
+                    "Chance of plow within 1 hour: {p_1h_pct}\n"
+                    "Chance of plow within 2 hours: {p_2h_pct}\n"
+                    "Chance of plow within 4 hours: {p_4h_pct}\n"
+                    "Chance of plow within 8 hours: {p_8h_pct}\n"
+                    "Estimated time to plow (60% chance): {eta_60_label}"
                 )
             },
         ),
@@ -844,15 +850,15 @@ with tab_pred:
         pred_view_state = pdk.ViewState(latitude=43.0481, longitude=-76.1474, zoom=12, pitch=0)
         tooltip = {
             "html": """
-            <b>{roadname}</b><br/>
-            Priority: {routepriority}<br/>
-            Route: {snowrouteid}<br/>
-            Status: {prediction_status}<br/>
-            p(≤1h): {p_1h}<br/>
-            p(≤2h): {p_2h}<br/>
-            p(≤4h): {p_4h}<br/>
-            p(≤8h): {p_8h}<br/>
-            ETA@60%: {eta_hours_60}h
+            <b>Road name:</b> {roadname}<br/>
+            <b>Priority level:</b> {routepriority}<br/>
+            <b>Route label:</b> {route_label}<br/>
+            <b>Prediction status:</b> {prediction_status}<br/>
+            <b>Chance of plow within 1 hour:</b> {p_1h_pct}<br/>
+            <b>Chance of plow within 2 hours:</b> {p_2h_pct}<br/>
+            <b>Chance of plow within 4 hours:</b> {p_4h_pct}<br/>
+            <b>Chance of plow within 8 hours:</b> {p_8h_pct}<br/>
+            <b>Estimated time to plow (60% chance):</b> {eta_60_label}
             """,
             "style": {"backgroundColor": "white", "color": "black"},
         }

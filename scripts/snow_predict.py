@@ -46,7 +46,8 @@ SEG = "snowroutesegmentid"
 TS = "snapshot_ts"
 
 HORIZONS = [1, 2, 4, 8]
-ETA_THRESHOLD = 0.60
+ETA_THRESHOLD_DEFAULT = 0.60
+CALIBRATION_MIN_ROWS_ISOTONIC = 500
 RANKING_KS = [10, 25, 50, 100]
 ARTIFACT_DIR = DATA_DIR / "artifacts_snow"
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -603,7 +604,6 @@ def expected_calibration_error(
         ece += np.abs(bin_acc - bin_conf) * (mask.sum() / len(y_true))
     return float(ece)
 
-
 def ranking_metrics_at_k(
     y_true: np.ndarray, y_prob: np.ndarray, ks: list[int]
 ) -> list[dict[str, float | int | None]]:
@@ -639,7 +639,8 @@ def ranking_metrics_at_k(
 def derive_eta_from_probs(prob_df: pd.DataFrame) -> pd.Series:
     def eta(row: pd.Series) -> float:
         for h in HORIZONS:
-            if row.get(f"p_{h}h", np.nan) >= ETA_THRESHOLD:
+            threshold = thresholds.get(h, ETA_THRESHOLD_DEFAULT)
+            if row.get(f"p_{h}h", np.nan) >= threshold:
                 return float(h)
         return np.nan
 
@@ -652,6 +653,7 @@ def train_eta_regression(
     train_mask: pd.Series,
     models: dict[int, HistGradientBoostingClassifier | None],
     calibrated: dict[int, CalibratedClassifierCV | None],
+    thresholds: dict[int, float] | None = None,
 ) -> tuple[HistGradientBoostingRegressor | None, dict[str, Any]]:
     valid = df["hours_to_next_service"].notna()
     train_idx = train_mask & valid
@@ -693,7 +695,7 @@ def train_eta_regression(
             prob_df[f"p_{h}h"] = np.nan
         else:
             prob_df[f"p_{h}h"] = model.predict_proba(X[test_idx])[:, 1]
-    eta_series = derive_eta_from_probs(prob_df)
+    eta_series = derive_eta_from_probs(prob_df, thresholds)
     valid_eta = eta_series.notna()
     if valid_eta.any():
         eta_true = y_true[valid_eta]
@@ -723,9 +725,10 @@ def train_models(
     pd.Series,
     HistGradientBoostingRegressor | None,
     dict[int, list[dict[str, float]]],
+    dict[int, float],
 ]:
     if df.empty:
-        return {}, {}, {}, pd.Series(dtype=float), None, {}
+        return {}, {}, {}, pd.Series(dtype=float), None, {}, {}
 
     train_cutoffs = df.groupby(EVENT)[TS].transform(lambda s: s.quantile(0.8))
     train_mask = df[TS] <= train_cutoffs
@@ -743,6 +746,8 @@ def train_models(
         "ranking": {},
     }
     feature_importance: dict[int, list[dict[str, float]]] = {}
+    threshold_values: dict[int, float] = {}
+    threshold_meta: dict[int, dict[str, float | int | None]] = {}
 
     calib_cutoffs = df.loc[train_mask].groupby(EVENT)[TS].transform(
         lambda s: s.quantile(0.8)
@@ -797,8 +802,12 @@ def train_models(
         models[h] = clf
 
         if not X_calib.empty and y_calib.nunique() >= 2:
-            calibrator = CalibratedClassifierCV(clf, cv=5, method="sigmoid")
-            calibrator.fit(X_train, y_train)
+            if len(X_calib) >= CALIBRATION_MIN_ROWS_ISOTONIC:
+                method = "isotonic"
+            else:
+                method = "sigmoid"
+            calibrator = CalibratedClassifierCV(clf, cv="prefit", method=method)
+            calibrator.fit(X_calib, y_calib)
             calibrated[h] = calibrator
         else:
             calibrated[h] = None
@@ -861,18 +870,58 @@ def train_models(
 
         if calibrated[h] is not None and not X_calib.empty and y_calib.nunique() >= 2:
             p_calib = calibrated[h].predict_proba(X_calib)[:, 1]
+            calibration_method = calibrated[h].method
+        elif not X_calib.empty and y_calib.nunique() >= 2:
+            p_calib = clf.predict_proba(X_calib)[:, 1]
+
+        if p_calib is not None:
             metrics["calibration"][h] = {
                 "rows": int(X_calib.shape[0]),
                 "brier": float(brier_score_loss(y_calib, p_calib)),
-                "ece": expected_calibration_error(
-                    y_calib.to_numpy(), p_calib
-                ),
+                "ece": expected_calibration_error(y_calib.to_numpy(), p_calib),
+                "method": calibration_method,
             }
         else:
             metrics["calibration"][h] = {
                 "rows": int(X_calib.shape[0]),
                 "brier": None,
                 "ece": None,
+                "method": None,
+            }
+
+        if p_calib is not None and y_calib.nunique() >= 2:
+            candidate_thresholds = np.unique(
+                np.clip(
+                    np.quantile(p_calib, np.linspace(0.05, 0.95, 19)),
+                    0.05,
+                    0.95,
+                )
+            )
+            if candidate_thresholds.size == 0:
+                candidate_thresholds = np.array([ETA_THRESHOLD_DEFAULT])
+
+            f1_scores = []
+            for threshold in candidate_thresholds:
+                preds = (p_calib >= threshold).astype(int)
+                f1_scores.append(sk_metrics.f1_score(y_calib, preds))
+            best_idx = int(np.argmax(f1_scores))
+            best_threshold = float(candidate_thresholds[best_idx])
+            threshold_values[h] = best_threshold
+            threshold_meta[h] = {
+                "threshold": best_threshold,
+                "f1": float(f1_scores[best_idx]),
+                "rows": int(X_calib.shape[0]),
+                "pos_rate": float(y_calib.mean()),
+                "metric": "f1",
+            }
+        else:
+            threshold_values[h] = ETA_THRESHOLD_DEFAULT
+            threshold_meta[h] = {
+                "threshold": ETA_THRESHOLD_DEFAULT,
+                "f1": None,
+                "rows": int(X_calib.shape[0]),
+                "pos_rate": float(y_calib.mean()) if len(y_calib) else None,
+                "metric": "f1",
             }
 
         if not X_test.empty and y_test.nunique() >= 2:
@@ -912,10 +961,19 @@ def train_models(
                 "note": "insufficient training data",
             }
         reg_model, reg_metrics = train_eta_regression(
-            df, X, train_mask, models, calibrated
+            df, X, train_mask, models, calibrated, thresholds=threshold_values
         )
         metrics["eta_regression"] = reg_metrics
-        return models, calibrated, metrics, medians, reg_model, feature_importance
+        metrics["thresholds"] = threshold_meta
+        return (
+            models,
+            calibrated,
+            metrics,
+            medians,
+            reg_model,
+            feature_importance,
+            threshold_values,
+        )
 
     n_splits = min(5, n_events)
     gkf = GroupKFold(n_splits=n_splits)
@@ -972,11 +1030,20 @@ def train_models(
         }
 
     reg_model, reg_metrics = train_eta_regression(
-        df, X, train_mask, models, calibrated
+        df, X, train_mask, models, calibrated, thresholds=threshold_values
     )
     metrics["eta_regression"] = reg_metrics
+    metrics["thresholds"] = threshold_meta
 
-    return models, calibrated, metrics, medians, reg_model, feature_importance
+    return (
+        models,
+        calibrated,
+        metrics,
+        medians,
+        reg_model,
+        feature_importance,
+        threshold_values,
+    )
 
 
 # -----------------------------
@@ -989,6 +1056,7 @@ def predict_latest(
     medians: pd.Series,
     features: list[str],
     reg_model: HistGradientBoostingRegressor | None,
+    thresholds: dict[int, float] | None = None,
 ) -> pd.DataFrame:
     latest = (
         df.sort_values([EVENT, SEG, TS])
@@ -1017,7 +1085,7 @@ def predict_latest(
     latest["p_4h"] = latest[["p_2h", "p_4h"]].max(axis=1)
     latest["p_8h"] = latest[["p_4h", "p_8h"]].max(axis=1)
 
-    latest["eta_hours_60"] = derive_eta_from_probs(latest)
+    latest["eta_hours_60"] = derive_eta_from_probs(latest, thresholds)
     latest["eta_ts_60"] = latest[TS] + pd.to_timedelta(latest["eta_hours_60"], unit="h")
 
     if reg_model is not None:
@@ -1134,12 +1202,24 @@ def main() -> None:
     ]
 
     train_df = featured[featured["prediction_status"] == "OK"].copy()
-    models, calibrated, metrics, medians, reg_model, feature_importance = train_models(
-        train_df, feature_cols
-    )
+    (
+        models,
+        calibrated,
+        metrics,
+        medians,
+        reg_model,
+        feature_importance,
+        threshold_values,
+    ) = train_models(train_df, feature_cols)
 
     pred_latest = predict_latest(
-        featured, models, calibrated, medians, feature_cols, reg_model
+        featured,
+        models,
+        calibrated,
+        medians,
+        feature_cols,
+        reg_model,
+        thresholds=threshold_values,
     )
     pred_path = ARTIFACT_DIR / "predictions_latest_prob.csv"
     pred_latest.to_csv(pred_path, index=False)
