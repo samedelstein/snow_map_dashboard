@@ -48,6 +48,7 @@ TS = "snapshot_ts"
 HORIZONS = [1, 2, 4, 8]
 ETA_THRESHOLD_DEFAULT = 0.60
 CALIBRATION_MIN_ROWS_ISOTONIC = 500
+RANKING_KS = [10, 25, 50, 100]
 ARTIFACT_DIR = DATA_DIR / "artifacts_snow"
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 ALERT_LOG_PATH = str(ARTIFACT_DIR / "nws_alerts_log.csv")
@@ -603,12 +604,39 @@ def expected_calibration_error(
         ece += np.abs(bin_acc - bin_conf) * (mask.sum() / len(y_true))
     return float(ece)
 
+def ranking_metrics_at_k(
+    y_true: np.ndarray, y_prob: np.ndarray, ks: list[int]
+) -> list[dict[str, float | int | None]]:
+    mask = np.isfinite(y_prob)
+    y_true = y_true[mask]
+    y_prob = y_prob[mask]
+    if y_true.size == 0:
+        return [
+            {"k": int(k), "precision": None, "recall": None, "total_positives": 0}
+            for k in ks
+        ]
 
-def derive_eta_from_probs(
-    prob_df: pd.DataFrame, thresholds: dict[int, float] | None = None
-) -> pd.Series:
-    thresholds = thresholds or {}
+    order = np.argsort(-y_prob)
+    total_pos = int(y_true.sum())
+    results = []
+    for k in ks:
+        k_use = int(min(k, y_true.size))
+        top_idx = order[:k_use]
+        hits = int(y_true[top_idx].sum())
+        precision = hits / k_use if k_use > 0 else None
+        recall = hits / total_pos if total_pos > 0 else None
+        results.append(
+            {
+                "k": int(k),
+                "precision": float(precision) if precision is not None else None,
+                "recall": float(recall) if recall is not None else None,
+                "total_positives": total_pos,
+            }
+        )
+    return results
 
+
+def derive_eta_from_probs(prob_df: pd.DataFrame) -> pd.Series:
     def eta(row: pd.Series) -> float:
         for h in HORIZONS:
             threshold = thresholds.get(h, ETA_THRESHOLD_DEFAULT)
@@ -715,6 +743,7 @@ def train_models(
         "within_event_time": {},
         "groupkfold_event": {},
         "calibration": {},
+        "ranking": {},
     }
     feature_importance: dict[int, list[dict[str, float]]] = {}
     threshold_values: dict[int, float] = {}
@@ -783,16 +812,22 @@ def train_models(
         else:
             calibrated[h] = None
 
-        if X_test.empty or y_test.nunique() < 2:
+        if X_test.empty:
             auc = None
             brier = None
             pr_auc = None
+            p = None
         else:
             model_for_eval = calibrated[h] or clf
             p = model_for_eval.predict_proba(X_test)[:, 1]
-            auc = float(roc_auc_score(y_test, p))
-            brier = float(brier_score_loss(y_test, p))
-            pr_auc = float(average_precision_score(y_test, p))
+            if y_test.nunique() < 2:
+                auc = None
+                brier = None
+                pr_auc = None
+            else:
+                auc = float(roc_auc_score(y_test, p))
+                brier = float(brier_score_loss(y_test, p))
+                pr_auc = float(average_precision_score(y_test, p))
 
         metrics["within_event_time"][h] = {
             "rows_train": int(X_train.shape[0]),
@@ -806,8 +841,33 @@ def train_models(
             "class_strategy": class_strategy,
         }
 
-        p_calib = None
-        calibration_method = None
+        if p is None or X_test.empty:
+            metrics["ranking"][h] = {
+                "rows_test": int(X_test.shape[0]),
+                "overall": [],
+                "priority_1": [],
+                "other": [],
+            }
+        else:
+            test_meta = df.loc[X_test.index]
+            priority_1_mask = test_meta["priority_num"].fillna(-1) == 1
+            metrics["ranking"][h] = {
+                "rows_test": int(X_test.shape[0]),
+                "overall": ranking_metrics_at_k(
+                    y_test.to_numpy(), p, RANKING_KS
+                ),
+                "priority_1": ranking_metrics_at_k(
+                    y_test[priority_1_mask].to_numpy(),
+                    p[priority_1_mask.to_numpy()],
+                    RANKING_KS,
+                ),
+                "other": ranking_metrics_at_k(
+                    y_test[~priority_1_mask].to_numpy(),
+                    p[~priority_1_mask.to_numpy()],
+                    RANKING_KS,
+                ),
+            }
+
         if calibrated[h] is not None and not X_calib.empty and y_calib.nunique() >= 2:
             p_calib = calibrated[h].predict_proba(X_calib)[:, 1]
             calibration_method = calibrated[h].method
