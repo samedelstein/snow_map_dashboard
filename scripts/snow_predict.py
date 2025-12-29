@@ -59,6 +59,248 @@ NOAA_STATION_ID = "KSYR"
 NWS_POINT = "43.0481,-76.1474"
 NWS_USER_AGENT = "snow_map_dashboard (https://github.com/samedelstein/snow_map_dashboard)"
 
+# -----------------------------
+# Storm windows (alerts + operational activity)
+# -----------------------------
+SNOW_ALERT_EVENTS = {
+    "Winter Storm Warning",
+    "Winter Storm Watch",
+    "Winter Weather Advisory",
+}
+
+NWS_ALERTS_LOG_LOCAL = str(ARTIFACT_DIR / "nws_alerts_log.csv")
+NWS_ALERTS_LOG_REMOTE = (
+    "https://raw.githubusercontent.com/samedelstein/snow_map_dashboard/main/"
+    "data/artifacts_snow/nws_alerts_log.csv"
+)
+
+# envelope expansion (tunable)
+ALERT_START_PAD_H = 6
+ALERT_END_PAD_H = 24
+
+# operational start/end detection (tunable)
+OPS_BUCKET_MIN = "15min"
+OPS_MIN_SERVICES_PER_BUCKET = 10   # tune based on your segment count
+OPS_SUSTAIN_BUCKETS = 2            # require sustained activity
+
+
+def load_alert_log(source: str | None = None) -> pd.DataFrame:
+    """
+    Load alerts log from local path or raw GitHub URL.
+    Returns df with columns: event, start_ts, end_ts, severity
+    """
+    src = source or (NWS_ALERTS_LOG_LOCAL if os.path.exists(NWS_ALERTS_LOG_LOCAL) else NWS_ALERTS_LOG_REMOTE)
+    try:
+        a = pd.read_csv(src)
+    except Exception:
+        return pd.DataFrame(columns=["event", "start_ts", "end_ts", "severity"])
+
+    if a.empty:
+        return pd.DataFrame(columns=["event", "start_ts", "end_ts", "severity"])
+
+    a["start_ts"] = pd.to_datetime(a["start_ts"], utc=True, errors="coerce")
+    a["end_ts"] = pd.to_datetime(a["end_ts"], utc=True, errors="coerce")
+    a["event"] = a["event"].astype(str)
+    a["severity"] = a.get("severity", "").astype(str)
+    a = a[a["start_ts"].notna() & a["end_ts"].notna()].copy()
+    return a
+
+
+def build_storm_envelopes_from_alerts(alerts: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge overlapping snow-related alerts into storm envelopes.
+    Output columns:
+      storm_id, storm_envelope_start, storm_envelope_end, severity_max
+    """
+    if alerts.empty:
+        return pd.DataFrame(columns=["storm_id", "storm_envelope_start", "storm_envelope_end", "severity_max"])
+
+    a = alerts[alerts["event"].isin(SNOW_ALERT_EVENTS)].copy()
+    if a.empty:
+        return pd.DataFrame(columns=["storm_id", "storm_envelope_start", "storm_envelope_end", "severity_max"])
+
+    # pad windows
+    a["storm_envelope_start"] = a["start_ts"] - pd.Timedelta(hours=ALERT_START_PAD_H)
+    a["storm_envelope_end"] = a["end_ts"] + pd.Timedelta(hours=ALERT_END_PAD_H)
+
+    # severity ordering
+    sev_rank = {"Minor": 1, "Moderate": 2, "Severe": 3, "Extreme": 4}
+    a["sev_rank"] = a["severity"].map(sev_rank).fillna(0).astype(int)
+
+    # merge overlaps by time
+    a = a.sort_values("storm_envelope_start").reset_index(drop=True)
+    merged = []
+    cur_start = None
+    cur_end = None
+    cur_sev = 0
+
+    for row in a.itertuples(index=False):
+        s = row.storm_envelope_start
+        e = row.storm_envelope_end
+        sev = int(row.sev_rank)
+
+
+        if cur_start is None:
+            cur_start, cur_end, cur_sev = s, e, sev
+            continue
+
+        if s <= cur_end:  # overlap
+            cur_end = max(cur_end, e)
+            cur_sev = max(cur_sev, sev)
+        else:
+            merged.append((cur_start, cur_end, cur_sev))
+            cur_start, cur_end, cur_sev = s, e, sev
+
+    if cur_start is not None:
+        merged.append((cur_start, cur_end, cur_sev))
+
+    inv_sev = {v: k for k, v in sev_rank.items()}
+    out = pd.DataFrame(
+        [
+            {
+                "storm_id": f"storm_{i+1:03d}",
+                "storm_envelope_start": s,
+                "storm_envelope_end": e,
+                "severity_max": inv_sev.get(sev, "Unknown"),
+            }
+            for i, (s, e, sev) in enumerate(merged)
+        ]
+    )
+    return out
+
+
+def derive_city_service_events(labeled: pd.DataFrame) -> pd.DataFrame:
+    """
+    Identify observed service events from lastserviced changes.
+    Returns a DataFrame of (snapshot_ts) timestamps where any segment was serviced.
+    """
+    if labeled.empty:
+        return pd.DataFrame(columns=[TS, EVENT])
+
+    tmp = labeled.sort_values([EVENT, SEG, TS]).copy()
+    tmp["prev_last"] = tmp.groupby([EVENT, SEG])["lastserviced"].shift(1)
+    tmp["lastserviced_changed"] = (tmp["lastserviced"].notna()) & (tmp["lastserviced"] != tmp["prev_last"])
+    svc = tmp.loc[tmp["lastserviced_changed"], [EVENT, TS]].copy()
+    return svc
+
+
+def refine_operational_windows(
+    storms: pd.DataFrame,
+    service_events: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    For each storm envelope, find operational start/end based on sustained city service counts.
+    Output columns:
+      storm_id, storm_envelope_start, storm_envelope_end,
+      storm_operational_start, storm_operational_end, severity_max
+    """
+    if storms.empty:
+        return pd.DataFrame(columns=[
+            "storm_id","storm_envelope_start","storm_envelope_end",
+            "storm_operational_start","storm_operational_end","severity_max"
+        ])
+
+    if service_events.empty:
+        out = storms.copy()
+        out["storm_operational_start"] = pd.NaT
+        out["storm_operational_end"] = pd.NaT
+        return out
+
+    svc = service_events.copy()
+    svc["bucket"] = svc[TS].dt.floor(OPS_BUCKET_MIN)
+
+    out_rows = []
+    for st in storms.itertuples(index=False):
+        s0 = st.storm_envelope_start
+        s1 = st.storm_envelope_end
+
+        ssvc = svc[(svc[TS] >= s0) & (svc[TS] <= s1)]
+        if ssvc.empty:
+            out_rows.append({
+                "storm_id": st.storm_id,
+                "storm_envelope_start": s0,
+                "storm_envelope_end": s1,
+                "storm_operational_start": pd.NaT,
+                "storm_operational_end": pd.NaT,
+                "severity_max": st.severity_max,
+            })
+            continue
+
+        counts = (
+            ssvc.groupby("bucket")
+                .size()
+                .rename("services")
+                .reset_index()
+                .sort_values("bucket")
+        )
+
+        # sustained activity mask
+        active = counts["services"] >= OPS_MIN_SERVICES_PER_BUCKET
+
+        # find first run of OPS_SUSTAIN_BUCKETS active buckets
+        op_start = pd.NaT
+        op_end = pd.NaT
+        if active.any():
+            # rolling window to find sustained True blocks
+            sustain = active.rolling(OPS_SUSTAIN_BUCKETS, min_periods=OPS_SUSTAIN_BUCKETS).sum() >= OPS_SUSTAIN_BUCKETS
+            if sustain.any():
+                first_idx = int(np.argmax(sustain.to_numpy()))
+                op_start = counts.iloc[first_idx]["bucket"]
+
+                # op_end = last active bucket time (or last sustained)
+                last_active_idx = int(np.where(active.to_numpy())[0].max())
+                op_end = counts.iloc[last_active_idx]["bucket"] + pd.Timedelta(OPS_BUCKET_MIN)
+
+        out_rows.append({
+            "storm_id": st.storm_id,
+            "storm_envelope_start": s0,
+            "storm_envelope_end": s1,
+            "storm_operational_start": op_start,
+            "storm_operational_end": op_end,
+            "severity_max": st.severity_max,
+        })
+
+    return pd.DataFrame(out_rows)
+
+
+def attach_storm_context(df: pd.DataFrame, storms_ops: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attach storm_id and storm operational start/end to each snapshot row.
+    If multiple storms overlap (rare after merging), pick the one whose envelope contains TS
+    with the closest operational start (or first).
+    """
+    if df.empty or storms_ops.empty:
+        out = df.copy()
+        out["storm_id"] = "no_storm"
+        out["storm_operational_start"] = pd.NaT
+        out["storm_operational_end"] = pd.NaT
+        out["storm_severity_max"] = "Unknown"
+        return out
+
+    storms = storms_ops.copy()
+    storms["storm_operational_start"] = pd.to_datetime(storms["storm_operational_start"], utc=True, errors="coerce")
+    storms["storm_operational_end"] = pd.to_datetime(storms["storm_operational_end"], utc=True, errors="coerce")
+
+    out = df.copy()
+    out["storm_id"] = "no_storm"
+
+    # Force proper dtypes up-front (prevents object dtype warnings/errors)
+    out["storm_operational_start"] = pd.to_datetime(pd.Series([pd.NaT] * len(out)), utc=True)
+    out["storm_operational_end"] = pd.to_datetime(pd.Series([pd.NaT] * len(out)), utc=True)
+
+    out["storm_severity_max"] = "Unknown"
+
+
+    # simple interval assignment: loop storms (should be few)
+    for st in storms.itertuples(index=False):
+        mask = (out[TS] >= st.storm_envelope_start) & (out[TS] <= st.storm_envelope_end)
+        out.loc[mask, "storm_id"] = st.storm_id
+        out.loc[mask, "storm_operational_start"] = st.storm_operational_start
+        out.loc[mask, "storm_operational_end"] = st.storm_operational_end
+        out.loc[mask, "storm_severity_max"] = st.severity_max
+
+    return out
+
 
 class _PrefitCalibrator:
     def __init__(self, estimator: HistGradientBoostingClassifier, method: str) -> None:
@@ -458,8 +700,9 @@ def label_next_service(df: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
         if times is None or len(times) == 0:
             next_times.append(pd.NaT)
             continue
-        idx = np.searchsorted(times, row.snapshot_ts.to_datetime64(), side="right")
-        next_times.append(times[idx] if idx < len(times) else pd.NaT)
+        times64 = pd.to_datetime(times, utc=True).to_numpy(dtype="datetime64[ns]")
+        idx = np.searchsorted(times64, row.snapshot_ts.to_datetime64(), side="right")
+        next_times.append(pd.to_datetime(times64[idx], utc=True) if idx < len(times64) else pd.NaT)
 
     labeled["next_serviced_at"] = pd.to_datetime(next_times, utc=True)
     labeled["hours_to_next_service"] = (
@@ -479,6 +722,14 @@ def add_features(
     alerts_hourly: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     f = df.sort_values([EVENT, SEG, TS]).copy()
+    for c, default in [
+        ("storm_id", "no_storm"),
+        ("storm_operational_start", pd.NaT),
+        ("storm_operational_end", pd.NaT),
+        ("storm_severity_max", "Unknown"),
+    ]:
+        if c not in f.columns:
+            f[c] = default
 
     f["priority_num"] = f["routepriority"].str.extract(r"(\d+)").astype(float)
     f["hour"] = f[TS].dt.hour
@@ -489,8 +740,73 @@ def add_features(
     f["passes_per_len"] = f["passes_event"] / denom
 
     f["prev_last"] = f.groupby([EVENT, SEG])["lastserviced"].shift(1)
-    f["lastserviced_changed"] = (f["lastserviced"] != f["prev_last"]).astype(int)
+    f["lastserviced_changed"] = (
+    f["lastserviced"].notna() & (f["prev_last"].notna()) & (f["lastserviced"] != f["prev_last"])).astype(int)
+
     f["hour_bucket"] = f[TS].dt.floor("h")
+    # phase signal (free operational mode)
+    if "eventphaseid" in f.columns:
+        phase_num = f["eventphaseid"].astype(str).str.extract(r"-(\d+)$")[0]
+        f["phase_num"] = pd.to_numeric(phase_num, errors="coerce").fillna(0)
+    else:
+        f["phase_num"] = 0
+
+    # storm clock features
+    f["in_storm"] = (
+        f["storm_operational_start"].notna()
+        & f["storm_operational_end"].notna()
+        & (f[TS] >= f["storm_operational_start"])
+        & (f[TS] <= f["storm_operational_end"])
+    ).astype(int)
+
+    f["hours_since_storm_start"] = (
+        (f[TS] - f["storm_operational_start"]).dt.total_seconds() / 3600.0
+    )
+    f["hours_until_storm_end"] = (
+        (f["storm_operational_end"] - f[TS]).dt.total_seconds() / 3600.0
+    )
+
+    f["hours_since_storm_start"] = f["hours_since_storm_start"].clip(lower=0).fillna(-1)
+    f["hours_until_storm_end"] = f["hours_until_storm_end"].clip(lower=0).fillna(-1)
+
+    # finer buckets (5-minute snapshots -> 15m works well)
+    f["bucket_15m"] = f[TS].dt.floor("15min")
+
+    # service events derived from lastserviced changes
+    svc = f.loc[f["lastserviced_changed"] == 1, [EVENT, "snowrouteid", TS]].copy()
+    svc["bucket_15m"] = svc[TS].dt.floor("15min")
+
+    # city tempo (services per 15m)
+    city_15m = (
+        svc.groupby([EVENT, "bucket_15m"])
+        .size()
+        .rename("city_services_15m")
+        .reset_index()
+    )
+    f = f.merge(city_15m, on=[EVENT, "bucket_15m"], how="left")
+    f["city_services_15m"] = f["city_services_15m"].fillna(0)
+
+    # route tempo (services per 15m)
+    route_15m = (
+        svc.groupby([EVENT, "snowrouteid", "bucket_15m"])
+        .size()
+        .rename("route_services_15m")
+        .reset_index()
+    )
+    f = f.merge(route_15m, on=[EVENT, "snowrouteid", "bucket_15m"], how="left")
+    f["route_services_15m"] = f["route_services_15m"].fillna(0)
+
+    # route completion: share of segments in route that have had ANY service in this event so far
+    f["_route_served_once"] = f.groupby([EVENT, "snowrouteid", SEG])["lastserviced_changed"].cummax()
+    route_completion = (
+        f.groupby([EVENT, "snowrouteid", "hour_bucket"])["_route_served_once"]
+        .mean()
+        .rename("route_completion_60m")
+        .reset_index()
+    )
+    f = f.merge(route_completion, on=[EVENT, "snowrouteid", "hour_bucket"], how="left")
+    f["route_completion_60m"] = f["route_completion_60m"].fillna(0)
+    f = f.drop(columns=["_route_served_once"])
 
     city = (
         events.assign(hour_bucket=events["serviced_at"].dt.floor("h"))
@@ -683,19 +999,16 @@ def ranking_metrics_at_k(
     return results
 
 
-def derive_eta_from_probs(
-    prob_df: pd.DataFrame, thresholds: dict[int, float] | None = None
-) -> pd.Series:
-    thresholds = thresholds or {}
-
+def derive_eta_from_probs(prob_df: pd.DataFrame, thresholds: dict[int, float] | None = None) -> pd.Series:
+    thr = thresholds or {}
     def eta(row: pd.Series) -> float:
         for h in HORIZONS:
-            threshold = thresholds.get(h, ETA_THRESHOLD_DEFAULT)
-            if row.get(f"p_{h}h", np.nan) >= threshold:
+            t = float(thr.get(h, ETA_THRESHOLD_DEFAULT))
+            if float(row.get(f"p_{h}h", np.nan)) >= t:
                 return float(h)
         return np.nan
-
     return prob_df.apply(eta, axis=1)
+
 
 
 def train_eta_regression(
@@ -1196,6 +1509,18 @@ def main() -> None:
 
     events = build_events(snapshots)
     labeled = label_next_service(snapshots, events)
+
+    # --- NEW: storms from alerts + operational activity ---
+    alerts_log = load_alert_log()  # local if present, else GitHub raw
+    storms_env = build_storm_envelopes_from_alerts(alerts_log)
+
+    service_events = derive_city_service_events(labeled)  # based on lastserviced changes
+    storms_ops = refine_operational_windows(storms_env, service_events)
+    labeled = attach_storm_context(labeled, storms_ops)
+
+    # optional debug once
+    print("storm cols present?", {"storm_operational_start","storm_operational_end"}.issubset(labeled.columns))
+
     weather_hourly, weather_meta = build_weather_features(labeled)
     alert_start, alert_end = _alert_window(labeled)
     alert_rows = load_nws_alerts(alert_start, alert_end)
@@ -1248,6 +1573,14 @@ def main() -> None:
         "wind_gust_mps_lag3",
         "nws_alert_count",
         "nws_alert_active",
+        "phase_num",
+        "in_storm",
+        "hours_since_storm_start",
+        "hours_until_storm_end",
+        "city_services_15m",
+        "route_services_15m",
+        "route_completion_60m",
+
     ]
 
     train_df = featured[featured["prediction_status"] == "OK"].copy()
