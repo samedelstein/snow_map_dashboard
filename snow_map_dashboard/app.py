@@ -670,11 +670,6 @@ with tab_live:
                     "Time-since-plow bucket: {bucket}\n"
                     "Segment length (miles): {miles:.3f}\n"
                     "Last plowed at: {lastserviced_dt}\n"
-                    "Chance of plow within 1 hour: {p_1h_pct}\n"
-                    "Chance of plow within 2 hours: {p_2h_pct}\n"
-                    "Chance of plow within 4 hours: {p_4h_pct}\n"
-                    "Chance of plow within 8 hours: {p_8h_pct}\n"
-                    "Estimated time to plow (60% chance): {eta_60_label}"
                 )
             },
         ),
