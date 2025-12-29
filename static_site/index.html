@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Snow Operations Map</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <link rel="stylesheet" href="assets/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Winter Operations Dashboard</p>
+          <h1>Snow Route Readiness</h1>
+          <p class="subtitle">
+            Track route priorities, route status, and current snow coverage
+            context at a glance.
+          </p>
+        </div>
+        <div class="status-pill">
+          <span class="dot"></span>
+          Live GeoJSON Feed (static demo)
+        </div>
+      </header>
+
+      <section class="metrics">
+        <div class="metric-card metric-wide">
+          <p class="metric-label">Total miles in snow route system (valid timestamps)</p>
+          <p class="metric-value" id="metric-total">--</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">Never plowed (before cutoff)</p>
+          <p class="metric-value" id="metric-never">--</p>
+          <div class="metric-bar"><span id="metric-never-bar"></span></div>
+          <p class="metric-foot" id="metric-never-foot">--</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">&gt; 24 hours</p>
+          <p class="metric-value" id="metric-gt24">--</p>
+          <div class="metric-bar"><span id="metric-gt24-bar"></span></div>
+          <p class="metric-foot" id="metric-gt24-foot">--</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">12–24 hours</p>
+          <p class="metric-value" id="metric-12-24">--</p>
+          <div class="metric-bar"><span id="metric-12-24-bar"></span></div>
+          <p class="metric-foot" id="metric-12-24-foot">--</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">6–12 hours</p>
+          <p class="metric-value" id="metric-6-12">--</p>
+          <div class="metric-bar"><span id="metric-6-12-bar"></span></div>
+          <p class="metric-foot" id="metric-6-12-foot">--</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">1–6 hours</p>
+          <p class="metric-value" id="metric-1-6">--</p>
+          <div class="metric-bar"><span id="metric-1-6-bar"></span></div>
+          <p class="metric-foot" id="metric-1-6-foot">--</p>
+        </div>
+        <div class="metric-card">
+          <p class="metric-label">&lt; 1 hour</p>
+          <p class="metric-value" id="metric-lt1">--</p>
+          <div class="metric-bar"><span id="metric-lt1-bar"></span></div>
+          <p class="metric-foot" id="metric-lt1-foot">--</p>
+        </div>
+      </section>
+
+      <main class="layout">
+        <section class="map-region">
+          <div id="map" class="map"></div>
+          <div class="map-legend">
+            <div>
+              <span class="legend-swatch bucket-never"></span>
+              Never plowed
+            </div>
+            <div>
+              <span class="legend-swatch bucket-gt24"></span>
+              &gt; 24 hours
+            </div>
+            <div>
+              <span class="legend-swatch bucket-12-24"></span>
+              12–24 hours
+            </div>
+            <div>
+              <span class="legend-swatch bucket-6-12"></span>
+              6–12 hours
+            </div>
+            <div>
+              <span class="legend-swatch bucket-1-6"></span>
+              1–6 hours
+            </div>
+            <div>
+              <span class="legend-swatch bucket-lt1"></span>
+              &lt; 1 hour
+            </div>
+          </div>
+        </section>
+
+        <aside class="context-panel">
+          <h2>Route Context</h2>
+          <p class="panel-lead">
+            Select a route to view attributes, priority, and service notes.
+          </p>
+          <div class="context-card" id="route-details">
+            <p class="muted">Click a route on the map to see details.</p>
+          </div>
+
+          <div class="panel-section">
+            <h3>Controls</h3>
+            <label class="control">
+              <span>Show routes</span>
+              <input type="checkbox" id="toggle-routes" checked />
+            </label>
+            <label class="control">
+              <span>Line opacity</span>
+              <input
+                type="range"
+                id="opacity-range"
+                min="0.2"
+                max="1"
+                step="0.1"
+                value="0.85"
+              />
+            </label>
+            <div class="control-group">
+              <span>Show buckets</span>
+              <div class="bucket-controls" id="bucket-controls">
+                <label><input type="checkbox" value="never" checked />Never</label>
+                <label><input type="checkbox" value="gt24" checked />&gt;24h</label>
+                <label><input type="checkbox" value="12-24" checked />12–24h</label>
+                <label><input type="checkbox" value="6-12" checked />6–12h</label>
+                <label><input type="checkbox" value="1-6" checked />1–6h</label>
+                <label><input type="checkbox" value="lt1" checked />&lt;1h</label>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-section">
+            <h3>Bucket-based schedule estimate</h3>
+            <div class="status-grid">
+              <div>
+                <p class="stat" id="prediction-current">--</p>
+                <p class="muted">Current storm bucket</p>
+              </div>
+              <div>
+                <p class="stat" id="prediction-typical">--</p>
+                <p class="muted">Typical bucket (filtered)</p>
+              </div>
+              <div>
+                <p class="stat" id="prediction-eta">--</p>
+                <p class="muted">Median bucket ETA</p>
+              </div>
+              <div>
+                <p class="stat" id="prediction-chance">--</p>
+                <p class="muted">Bucket chance &le;4h</p>
+              </div>
+            </div>
+            <p class="muted" id="prediction-note"></p>
+          </div>
+
+          <div class="panel-section">
+            <h3>Coverage Status</h3>
+            <div class="status-grid">
+              <div>
+                <p class="stat">82%</p>
+                <p class="muted">Plowed coverage</p>
+              </div>
+              <div>
+                <p class="stat">14</p>
+                <p class="muted">Active routes</p>
+              </div>
+              <div>
+                <p class="stat">4</p>
+                <p class="muted">Standby crews</p>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="assets/app.js"></script>
+  </body>
+</html>
