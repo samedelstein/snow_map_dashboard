@@ -121,7 +121,9 @@ const bindControls = () => {
 
 const loadRoutes = async () => {
   try {
-    const response = await fetch("../winter_operations_snow_routes_layer0.geojson");
+    const response = await fetch(
+      "../../winter_operations_snow_routes_layer0.geojson"
+    );
     if (!response.ok) throw new Error("Failed to load GeoJSON");
     geojsonData = await response.json();
     renderRoutes();
