@@ -1,0 +1,74 @@
+name: Build static site
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install numpy pandas requests scikit-learn
+
+      - name: Check data inputs
+        id: data-check
+        run: |
+          run_snapshot=false
+          run_prediction=false
+
+          if [ ! -f data/snapshot_snow_routes/latest_routes.geojson ]; then
+            run_snapshot=true
+          fi
+
+          if [ ! -f data/artifacts_snow/predictions_latest_prob.csv ]; then
+            run_prediction=true
+          fi
+
+          echo "run_snapshot=${run_snapshot}" >> "$GITHUB_OUTPUT"
+          echo "run_prediction=${run_prediction}" >> "$GITHUB_OUTPUT"
+
+      - name: Run snapshot job (if needed)
+        if: ${{ steps.data-check.outputs.run_snapshot == 'true' }}
+        run: python -m snow_map_dashboard.snapshot
+
+      - name: Run prediction job (if needed)
+        if: ${{ steps.data-check.outputs.run_prediction == 'true' }}
+        run: python scripts/snow_predict.py
+
+      - name: Export static site
+        run: python scripts/export_static_site.py
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload static site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: static_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
