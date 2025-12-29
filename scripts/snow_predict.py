@@ -683,7 +683,11 @@ def ranking_metrics_at_k(
     return results
 
 
-def derive_eta_from_probs(prob_df: pd.DataFrame) -> pd.Series:
+def derive_eta_from_probs(
+    prob_df: pd.DataFrame, thresholds: dict[int, float] | None = None
+) -> pd.Series:
+    thresholds = thresholds or {}
+
     def eta(row: pd.Series) -> float:
         for h in HORIZONS:
             threshold = thresholds.get(h, ETA_THRESHOLD_DEFAULT)
