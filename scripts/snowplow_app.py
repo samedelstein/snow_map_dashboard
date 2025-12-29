@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import pydeck as pdk
-
+import sys
 
 # ============================================================
 # Config
@@ -23,6 +23,8 @@ BASE_URL = (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(REPO_ROOT / "snow_map_dashboard"))
+from bucket_copy import BUCKET_EXPLAINER_TEXT
 DATA_DIR = REPO_ROOT / "data"
 ARTIFACT_DIR = DATA_DIR / "artifacts_snow"
 PRED_PATH = ARTIFACT_DIR / "predictions_latest_prob.csv"
@@ -194,7 +196,21 @@ def load_predictions():
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], utc=True, errors="coerce")
 
-    for c in ["p_1h", "p_2h", "p_4h", "p_8h"]:
+    prob_cols = [
+        "p_1h",
+        "p_2h",
+        "p_4h",
+        "p_8h",
+        "p_bucket_1h",
+        "p_bucket_2h",
+        "p_bucket_4h",
+        "p_bucket_8h",
+        "p_ml_1h",
+        "p_ml_2h",
+        "p_ml_4h",
+        "p_ml_8h",
+    ]
+    for c in prob_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -264,6 +280,19 @@ def attach_predictions_to_geojson(geojson_obj: dict, preds: pd.DataFrame, eventi
 
     fields = [
         "prediction_status",
+        "bucket_priority_id",
+        "bucket_id",
+        "current_bucket_priority",
+        "current_bucket_id",
+        "eta_bucket_hours",
+        "p_bucket_1h",
+        "p_bucket_2h",
+        "p_bucket_4h",
+        "p_bucket_8h",
+        "p_ml_1h",
+        "p_ml_2h",
+        "p_ml_4h",
+        "p_ml_8h",
         "eta_hours_60",
         "p_1h",
         "p_2h",
@@ -302,9 +331,44 @@ def attach_predictions_to_geojson(geojson_obj: dict, preds: pd.DataFrame, eventi
             else:
                 props["_line_color"] = prob_to_color(row.get(color_by))
 
+        props["p_1h_pct"] = format_probability(props.get("p_1h"))
+        props["p_2h_pct"] = format_probability(props.get("p_2h"))
+        props["p_4h_pct"] = format_probability(props.get("p_4h"))
+        props["p_8h_pct"] = format_probability(props.get("p_8h"))
+        props["p_bucket_4h_pct"] = format_probability(props.get("p_bucket_4h"))
+        props["p_ml_4h_pct"] = format_probability(props.get("p_ml_4h"))
+        props["eta_60_label"] = format_eta_hours(props.get("eta_hours_60"))
+        props["eta_bucket_label"] = format_eta_hours(props.get("eta_bucket_hours"))
+        props["bucket_priority_label"] = format_bucket_priority(props.get("bucket_priority_id"))
+        props["current_bucket_priority_label"] = format_bucket_priority(
+            props.get("current_bucket_priority")
+        )
         feat["properties"] = props
 
     return geojson_obj
+
+
+def format_probability(value: float) -> str:
+    if pd.isna(value):
+        return "N/A"
+    return f"{value * 100:.0f}%"
+
+
+def format_eta_hours(value: float) -> str:
+    if pd.isna(value):
+        return "N/A"
+    return f"{value:.1f} hours"
+
+
+def format_bucket_priority(value: str | float | None) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    label = str(value)
+    if label.lower() in {"nan", "none", ""}:
+        return "N/A"
+    if label.startswith("P") and label[1:].isdigit():
+        return f"Priority {label[1:]}"
+    return label
 
 
 # ============================================================
@@ -334,7 +398,11 @@ with st.sidebar:
 
     st.divider()
     st.header("Predictions")
-    color_by = st.selectbox("Color predictions by", ["p_1h", "p_2h", "p_4h", "p_8h"], index=2)
+    color_by = st.selectbox(
+        "Color predictions by",
+        ["p_1h", "p_2h", "p_4h", "p_8h", "p_bucket_4h", "p_ml_4h"],
+        index=2,
+    )
     min_prob = st.slider("Min probability (for table)", 0.0, 1.0, 0.0, 0.05)
 
 # Auto-refresh MUST come after sidebar definitions
@@ -603,6 +671,33 @@ with tab_pred:
 
     st.caption("Color scale uses probabilities. Grey segments are untracked/no prediction.")
 
+    event_slice = preds[preds["eventid"] == selected_event].copy()
+    current_bucket = None
+    if "current_bucket_priority" in event_slice.columns:
+        bucket_mode = event_slice["current_bucket_priority"].dropna().mode()
+        current_bucket = bucket_mode.iloc[0] if not bucket_mode.empty else None
+
+    typical_bucket = None
+    if "bucket_priority_id" in view.columns:
+        typical_mode = view["bucket_priority_id"].dropna().mode()
+        typical_bucket = typical_mode.iloc[0] if not typical_mode.empty else None
+
+    st.subheader("Bucket-based schedule estimate")
+    st.caption(BUCKET_EXPLAINER_TEXT)
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Current storm bucket", format_bucket_priority(current_bucket))
+    b2.metric("Typical bucket (filtered)", format_bucket_priority(typical_bucket))
+    if "eta_bucket_hours" in view.columns:
+        eta_bucket_median = view["eta_bucket_hours"].median()
+        b3.metric("Median bucket ETA", format_eta_hours(eta_bucket_median))
+    else:
+        b3.metric("Median bucket ETA", "N/A")
+    if "p_bucket_4h" in view.columns:
+        bucket_prob_median = view["p_bucket_4h"].median()
+        b4.metric("Bucket chance ≤4h", format_probability(bucket_prob_median))
+    else:
+        b4.metric("Bucket chance ≤4h", "N/A")
+
     # Map
     if not geojson_obj:
         st.warning(f"GeoJSON not found at {GEOJSON_PATH.name}. Add it to render the prediction map.")
@@ -625,12 +720,17 @@ with tab_pred:
             <b>{roadname}</b><br/>
             Priority: {routepriority}<br/>
             Route: {snowrouteid}<br/>
+            Typical bucket: {bucket_priority_label}<br/>
+            Current storm bucket: {current_bucket_priority_label}<br/>
+            Bucket ETA: {eta_bucket_label}<br/>
             Status: {prediction_status}<br/>
-            p(≤1h): {p_1h}<br/>
-            p(≤2h): {p_2h}<br/>
-            p(≤4h): {p_4h}<br/>
-            p(≤8h): {p_8h}<br/>
-            ETA@60%: {eta_hours_60}h
+            p(≤1h): {p_1h_pct}<br/>
+            p(≤2h): {p_2h_pct}<br/>
+            p(≤4h): {p_4h_pct}<br/>
+            p(≤8h): {p_8h_pct}<br/>
+            Bucket p(≤4h): {p_bucket_4h_pct}<br/>
+            Model p(≤4h): {p_ml_4h_pct}<br/>
+            ETA@60%: {eta_60_label}
             """,
             "style": {"backgroundColor": "white", "color": "black"},
         }
@@ -649,18 +749,33 @@ with tab_pred:
         table = table[table[color_by].fillna(0) >= float(min_prob)]
         table = table.sort_values(color_by, ascending=False)
 
-    show_cols = [c for c in [
-        "roadname",
-        "routepriority",
-        "snowrouteid",
-        "p_1h",
-        "p_2h",
-        "p_4h",
-        "p_8h",
-        "eta_hours_60",
-        "prediction_status",
-        "snowroutesegmentid",
-    ] if c in table.columns]
+    show_cols = [
+        c
+        for c in [
+            "roadname",
+            "routepriority",
+            "snowrouteid",
+            "bucket_priority_id",
+            "current_bucket_priority",
+            "eta_bucket_hours",
+            "p_bucket_1h",
+            "p_bucket_2h",
+            "p_bucket_4h",
+            "p_bucket_8h",
+            "p_ml_1h",
+            "p_ml_2h",
+            "p_ml_4h",
+            "p_ml_8h",
+            "p_1h",
+            "p_2h",
+            "p_4h",
+            "p_8h",
+            "eta_hours_60",
+            "prediction_status",
+            "snowroutesegmentid",
+        ]
+        if c in table.columns
+    ]
 
     st.dataframe(table[show_cols].head(500), use_container_width=True)
 
