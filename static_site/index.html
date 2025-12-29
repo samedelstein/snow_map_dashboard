@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Syracuse Snow Routes – Live + Predictions</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="assets/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div>
+        <p class="eyebrow">City of Syracuse</p>
+        <h1>Syracuse Snow Routes</h1>
+        <p class="subtitle">Live plow status with prediction overlays</p>
+      </div>
+      <div class="status" id="status">Loading data…</div>
+    </header>
+
+    <main class="layout">
+      <section class="map-panel">
+        <div id="map"></div>
+        <div class="legend">
+          <h2>Last serviced</h2>
+          <ul>
+            <li><span class="swatch bucket-never"></span>Never plowed (before cutoff)</li>
+            <li><span class="swatch bucket-gt24"></span>&gt; 24 hours</li>
+            <li><span class="swatch bucket-12-24"></span>12–24 hours</li>
+            <li><span class="swatch bucket-6-12"></span>6–12 hours</li>
+            <li><span class="swatch bucket-1-6"></span>1–6 hours</li>
+            <li><span class="swatch bucket-lt1"></span>&lt; 1 hour</li>
+          </ul>
+        </div>
+      </section>
+
+      <aside class="side-panel">
+        <h2>Segment details</h2>
+        <div id="details" class="details">
+          <p>Select a route segment to view live and predicted service details.</p>
+        </div>
+        <div class="panel-section">
+          <h3>Prediction summary</h3>
+          <ul class="summary-list">
+            <li><span>Prediction status</span><strong id="summary-status">–</strong></li>
+            <li><span>ETA (hours)</span><strong id="summary-eta">–</strong></li>
+            <li><span>Storm severity</span><strong id="summary-severity">–</strong></li>
+          </ul>
+        </div>
+      </aside>
+    </main>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="assets/app.js"></script>
+  </body>
+</html>
