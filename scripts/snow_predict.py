@@ -54,6 +54,8 @@ RANKING_KS = [10, 25, 50, 100]
 ARTIFACT_DIR = DATA_DIR / "artifacts_snow"
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 ALERT_LOG_PATH = str(ARTIFACT_DIR / "nws_alerts_log.csv")
+BUCKET_LADDER_PATH = ARTIFACT_DIR / "bucket_ladder.csv"
+BUCKET_LADDER_PRIORITY_PATH = ARTIFACT_DIR / "bucket_ladder_priority.csv"
 
 NOAA_STATION_ID = "KSYR"
 NWS_POINT = "43.0481,-76.1474"
@@ -82,6 +84,15 @@ ALERT_END_PAD_H = 24
 OPS_BUCKET_MIN = "15min"
 OPS_MIN_SERVICES_PER_BUCKET = 10   # tune based on your segment count
 OPS_SUSTAIN_BUCKETS = 2            # require sustained activity
+
+# bucket baseline parameters
+BUCKET_CURRENT_WINDOW = "30min"
+BUCKET_SOFTNESS_HOURS = 1.75
+BUCKET_BLEND_MIN_CITY_15M = 10
+BUCKET_BLEND_LOW_CITY_15M = 2
+BUCKET_BLEND_WEIGHT_HIGH = 0.75
+BUCKET_BLEND_WEIGHT_MID = 0.6
+BUCKET_BLEND_WEIGHT_LOW = 0.45
 
 
 def load_alert_log(source: str | None = None) -> pd.DataFrame:
@@ -732,6 +743,23 @@ def add_features(
             f[c] = default
 
     f["priority_num"] = f["routepriority"].str.extract(r"(\d+)").astype(float)
+    route_label = (
+        f["snowrouteid"]
+        .fillna("UNK")
+        .astype(str)
+        .str.strip()
+        .replace({"": "UNK", "nan": "UNK", "None": "UNK"})
+    )
+    route_key = route_label.str.replace(r"\s+", "", regex=True).str.replace(
+        r"[^A-Za-z0-9_-]", "", regex=True
+    )
+    priority_label = f["priority_num"].apply(
+        lambda x: f"P{int(x)}" if pd.notna(x) else "PUNK"
+    )
+    f["route_label"] = route_label
+    f["route_key"] = route_key
+    f["bucket_priority_id"] = priority_label
+    f["bucket_id"] = priority_label + "-R" + route_key
     f["hour"] = f[TS].dt.hour
     f["dow"] = f[TS].dt.weekday
     f["hours_since_last_service"] = (f[TS] - f["lastserviced"]).dt.total_seconds() / 3600
@@ -926,6 +954,224 @@ def add_features(
         f["nws_alert_active"] = 0
 
     return f
+
+
+# -----------------------------
+# Bucket baseline model
+# -----------------------------
+def _build_bucket_ladder(
+    bucket_starts: pd.DataFrame,
+    bucket_col: str,
+) -> pd.DataFrame:
+    if bucket_starts.empty:
+        return pd.DataFrame(
+            columns=[
+                "bucket_from",
+                "bucket_to",
+                "delta_hours_median",
+                "delta_hours_p10",
+                "delta_hours_p90",
+                "n_events",
+                "n_pairs",
+            ]
+        )
+
+    pairs = bucket_starts.merge(bucket_starts, on=EVENT, suffixes=("_from", "_to"))
+    pairs["delta_hours"] = (
+        pairs[f"{TS}_to"] - pairs[f"{TS}_from"]
+    ).dt.total_seconds() / 3600.0
+    pairs = pairs[pairs["delta_hours"].notna()]
+    pairs = pairs[pairs["delta_hours"] >= 0]
+
+    summary = (
+        pairs.groupby([f"{bucket_col}_from", f"{bucket_col}_to"])
+        .agg(
+            delta_hours_median=("delta_hours", "median"),
+            delta_hours_p10=("delta_hours", lambda x: x.quantile(0.1)),
+            delta_hours_p90=("delta_hours", lambda x: x.quantile(0.9)),
+            n_events=(EVENT, "nunique"),
+            n_pairs=("delta_hours", "size"),
+        )
+        .reset_index()
+        .rename(
+            columns={
+                f"{bucket_col}_from": "bucket_from",
+                f"{bucket_col}_to": "bucket_to",
+            }
+        )
+    )
+    return summary
+
+
+def build_bucket_ladders(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if df.empty:
+        empty = pd.DataFrame(
+            columns=[
+                "bucket_from",
+                "bucket_to",
+                "delta_hours_median",
+                "delta_hours_p10",
+                "delta_hours_p90",
+                "n_events",
+                "n_pairs",
+            ]
+        )
+        return empty.copy(), empty.copy()
+
+    service_events = df.loc[df["lastserviced_changed"] == 1, [EVENT, TS, "bucket_id", "bucket_priority_id"]].copy()
+    service_events = service_events.dropna(subset=[EVENT, TS])
+    service_events["bucket_id"] = service_events["bucket_id"].fillna("PUNK-RUNK")
+    service_events["bucket_priority_id"] = service_events["bucket_priority_id"].fillna("PUNK")
+
+    bucket_starts = (
+        service_events.groupby([EVENT, "bucket_id"])[TS]
+        .min()
+        .reset_index()
+    )
+    priority_starts = (
+        service_events.groupby([EVENT, "bucket_priority_id"])[TS]
+        .min()
+        .reset_index()
+    )
+
+    bucket_ladder = _build_bucket_ladder(bucket_starts, "bucket_id")
+    priority_ladder = _build_bucket_ladder(priority_starts, "bucket_priority_id")
+    return bucket_ladder, priority_ladder
+
+
+def _bucket_lookup_map(ladder: pd.DataFrame) -> dict[tuple[str, str], float]:
+    return {
+        (row.bucket_from, row.bucket_to): row.delta_hours_median
+        for row in ladder.itertuples(index=False)
+    }
+
+
+def _derive_current_bucket(
+    service_events: pd.DataFrame,
+    latest_event_times: pd.DataFrame,
+    bucket_col: str,
+    window: str,
+) -> dict[str, str | None]:
+    current = {}
+    for row in latest_event_times.itertuples(index=False):
+        event_id = row.eventid
+        now_ts = row.snapshot_ts
+        window_start = now_ts - pd.Timedelta(window)
+        mask = (
+            (service_events[EVENT] == event_id)
+            & (service_events[TS] >= window_start)
+            & (service_events[TS] <= now_ts)
+        )
+        counts = service_events.loc[mask].groupby(bucket_col).size()
+        current[event_id] = counts.idxmax() if not counts.empty else None
+    return current
+
+
+def _sigmoid(x: pd.Series | np.ndarray) -> pd.Series | np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def attach_bucket_baseline(
+    latest: pd.DataFrame,
+    full_df: pd.DataFrame,
+    bucket_ladder: pd.DataFrame,
+    priority_ladder: pd.DataFrame,
+) -> pd.DataFrame:
+    if latest.empty:
+        return latest
+
+    service_events = full_df.loc[
+        full_df["lastserviced_changed"] == 1,
+        [EVENT, TS, "bucket_id", "bucket_priority_id"],
+    ].copy()
+    service_events = service_events.dropna(subset=[EVENT, TS])
+    if service_events.empty:
+        for h in HORIZONS:
+            latest[f"p_bucket_{h}h"] = np.nan
+        latest["current_bucket_id"] = None
+        latest["current_bucket_priority"] = None
+        latest["eta_bucket_hours"] = np.nan
+        return latest
+
+    latest_event_times = (
+        latest.groupby(EVENT, as_index=False)[TS].max().rename(columns={TS: "snapshot_ts"})
+    )
+    current_bucket_id = _derive_current_bucket(
+        service_events,
+        latest_event_times,
+        "bucket_id",
+        BUCKET_CURRENT_WINDOW,
+    )
+    current_bucket_priority = _derive_current_bucket(
+        service_events,
+        latest_event_times,
+        "bucket_priority_id",
+        BUCKET_CURRENT_WINDOW,
+    )
+
+    bucket_starts = (
+        service_events.groupby([EVENT, "bucket_id"])[TS]
+        .min()
+        .to_dict()
+    )
+    priority_starts = (
+        service_events.groupby([EVENT, "bucket_priority_id"])[TS]
+        .min()
+        .to_dict()
+    )
+
+    bucket_lookup = _bucket_lookup_map(bucket_ladder)
+    priority_lookup = _bucket_lookup_map(priority_ladder)
+
+    def compute_eta(row: pd.Series) -> float:
+        event_id = row[EVENT]
+        now_ts = row[TS]
+        current_bucket = current_bucket_id.get(event_id)
+        current_priority = current_bucket_priority.get(event_id)
+
+        delta = None
+        if current_bucket is not None:
+            delta = bucket_lookup.get((current_bucket, row["bucket_id"]))
+
+        if delta is None and current_priority is not None:
+            delta = priority_lookup.get((current_priority, row["bucket_priority_id"]))
+
+        if delta is None:
+            return np.nan
+
+        if current_bucket is not None:
+            current_start = bucket_starts.get((event_id, current_bucket))
+        else:
+            current_start = None
+
+        if current_start is None and current_priority is not None:
+            current_start = priority_starts.get((event_id, current_priority))
+
+        if current_start is None:
+            return np.nan
+
+        hours_since = (now_ts - current_start).total_seconds() / 3600.0
+        hours_since = max(0.0, hours_since)
+        return max(0.0, delta - hours_since)
+
+    latest["current_bucket_id"] = latest[EVENT].map(current_bucket_id)
+    latest["current_bucket_priority"] = latest[EVENT].map(current_bucket_priority)
+    latest["eta_bucket_hours"] = latest.apply(compute_eta, axis=1)
+
+    for h in HORIZONS:
+        latest[f"p_bucket_{h}h"] = _sigmoid(
+            (h - latest["eta_bucket_hours"]) / BUCKET_SOFTNESS_HOURS
+        )
+
+    return latest
+
+
+def compute_blend_weight(row: pd.Series) -> float:
+    if row.get("in_storm", 0) == 1 and row.get("city_services_15m", 0) >= BUCKET_BLEND_MIN_CITY_15M:
+        return BUCKET_BLEND_WEIGHT_HIGH
+    if row.get("in_storm", 0) == 1 and row.get("city_services_15m", 0) >= BUCKET_BLEND_LOW_CITY_15M:
+        return BUCKET_BLEND_WEIGHT_MID
+    return BUCKET_BLEND_WEIGHT_LOW
 
 
 def mark_untracked(df: pd.DataFrame) -> pd.DataFrame:
@@ -1418,6 +1664,8 @@ def predict_latest(
     medians: pd.Series,
     features: list[str],
     reg_model: HistGradientBoostingRegressor | None,
+    bucket_ladder: pd.DataFrame | None = None,
+    priority_ladder: pd.DataFrame | None = None,
     thresholds: dict[int, float] | None = None,
 ) -> pd.DataFrame:
     latest = (
@@ -1439,9 +1687,27 @@ def predict_latest(
     for h in HORIZONS:
         model = calibrated.get(h) or models.get(h)
         if model is None:
-            latest[f"p_{h}h"] = np.nan
+            latest[f"p_ml_{h}h"] = np.nan
         else:
-            latest[f"p_{h}h"] = model.predict_proba(X_now)[:, 1]
+            latest[f"p_ml_{h}h"] = model.predict_proba(X_now)[:, 1]
+
+    bucket_ladder = bucket_ladder if bucket_ladder is not None else pd.DataFrame()
+    priority_ladder = priority_ladder if priority_ladder is not None else pd.DataFrame()
+    latest = attach_bucket_baseline(latest, df, bucket_ladder, priority_ladder)
+    latest["p_blend_weight"] = latest.apply(compute_blend_weight, axis=1)
+
+    for h in HORIZONS:
+        p_ml = latest[f"p_ml_{h}h"]
+        p_bucket = latest[f"p_bucket_{h}h"]
+        blended = (
+            latest["p_blend_weight"] * p_ml
+            + (1 - latest["p_blend_weight"]) * p_bucket
+        )
+        latest[f"p_{h}h"] = np.where(
+            p_ml.isna() & p_bucket.isna(),
+            np.nan,
+            np.where(p_ml.isna(), p_bucket, np.where(p_bucket.isna(), p_ml, blended)),
+        )
 
     latest["p_2h"] = latest[["p_1h", "p_2h"]].max(axis=1)
     latest["p_4h"] = latest[["p_2h", "p_4h"]].max(axis=1)
@@ -1457,6 +1723,7 @@ def predict_latest(
 
     for h in HORIZONS:
         latest.loc[latest["prediction_status"] != "OK", f"p_{h}h"] = np.nan
+        latest.loc[latest["prediction_status"] != "OK", f"p_ml_{h}h"] = np.nan
     latest.loc[
         latest["prediction_status"] != "OK",
         ["eta_hours_60", "eta_ts_60", "eta_hours_pred"],
@@ -1529,6 +1796,7 @@ def main() -> None:
     featured = add_features(
         labeled, events, neighbor_lookup, weather_hourly, alerts_hourly
     )
+    bucket_ladder, priority_ladder = build_bucket_ladders(featured)
     featured = mark_untracked(featured)
     featured = add_horizon_labels(featured)
 
@@ -1601,10 +1869,15 @@ def main() -> None:
         medians,
         feature_cols,
         reg_model,
+        bucket_ladder=bucket_ladder,
+        priority_ladder=priority_ladder,
         thresholds=threshold_values,
     )
     pred_path = ARTIFACT_DIR / "predictions_latest_prob.csv"
     pred_latest.to_csv(pred_path, index=False)
+
+    bucket_ladder.to_csv(BUCKET_LADDER_PATH, index=False)
+    priority_ladder.to_csv(BUCKET_LADDER_PRIORITY_PATH, index=False)
 
     metrics_path = ARTIFACT_DIR / "model_metrics_prob.json"
     metrics["feature_importance_path"] = os.path.join(
