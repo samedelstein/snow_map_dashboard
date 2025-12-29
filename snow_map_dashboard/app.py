@@ -9,6 +9,7 @@ import pydeck as pdk
 import requests
 import streamlit as st
 
+from bucket_copy import BUCKET_EXPLAINER_TEXT
 
 # -----------------------------
 # Config
@@ -230,6 +231,17 @@ def load_latest_predictions(path: Path) -> pd.DataFrame:
         "p_2h",
         "p_4h",
         "p_8h",
+        "p_ml_1h",
+        "p_ml_2h",
+        "p_ml_4h",
+        "p_ml_8h",
+        "p_bucket_1h",
+        "p_bucket_2h",
+        "p_bucket_4h",
+        "p_bucket_8h",
+        "eta_bucket_hours",
+        "current_bucket_priority",
+        "bucket_priority_id",
         "eta_hours_60",
         "eta_ts_60",
         "eta_hours_pred",
@@ -262,7 +274,21 @@ def load_predictions() -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], utc=True, errors="coerce")
 
-    for c in ["p_1h", "p_2h", "p_4h", "p_8h"]:
+    prob_cols = [
+        "p_1h",
+        "p_2h",
+        "p_4h",
+        "p_8h",
+        "p_bucket_1h",
+        "p_bucket_2h",
+        "p_bucket_4h",
+        "p_bucket_8h",
+        "p_ml_1h",
+        "p_ml_2h",
+        "p_ml_4h",
+        "p_ml_8h",
+    ]
+    for c in prob_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -273,6 +299,9 @@ def load_predictions() -> pd.DataFrame:
 
     if "snowroutesegmentid" in df.columns:
         df["snowroutesegmentid"] = df["snowroutesegmentid"].astype(str)
+
+    if "bucket_priority_id" not in df.columns and "routepriority" in df.columns:
+        df["bucket_priority_id"] = df["routepriority"].apply(derive_bucket_priority_id)
 
     return df
 
@@ -328,8 +357,31 @@ def attach_predictions_to_geojson(geojson_obj: dict, preds: pd.DataFrame, eventi
         g = int(255 * prob)
         return [r, g, 60, 220]
 
+    tier_colors = {
+        "Now (≤1h)": [44, 162, 95, 220],
+        "Soon (1–4h)": [253, 187, 132, 220],
+        "Later today (4–8h)": [252, 141, 89, 220],
+        "Overnight (8–12h)": [227, 74, 51, 220],
+        "Next day (12–24h)": [179, 0, 0, 220],
+        "Later (24h+)": [84, 39, 143, 220],
+        "Unknown": [120, 120, 120, 160],
+    }
+
     fields = [
         "prediction_status",
+        "bucket_priority_id",
+        "bucket_id",
+        "current_bucket_priority",
+        "current_bucket_id",
+        "eta_bucket_hours",
+        "p_bucket_1h",
+        "p_bucket_2h",
+        "p_bucket_4h",
+        "p_bucket_8h",
+        "p_ml_1h",
+        "p_ml_2h",
+        "p_ml_4h",
+        "p_ml_8h",
         "eta_hours_60",
         "p_1h",
         "p_2h",
@@ -366,13 +418,34 @@ def attach_predictions_to_geojson(geojson_obj: dict, preds: pd.DataFrame, eventi
             if status == "NO_PRED_UNTRACKED":
                 props["_line_color"] = [160, 160, 160, 180]
             else:
-                props["_line_color"] = prob_to_color(row.get(color_by))
+                if color_by == "bucket_eta_tier":
+                    eta_value = props.get("eta_bucket_hours") or props.get("eta_hours_60")
+                    tier = bucket_eta_tier(eta_value)
+                    props["_line_color"] = tier_colors.get(tier, tier_colors["Unknown"])
+                else:
+                    props["_line_color"] = prob_to_color(row.get(color_by))
 
         props["route_label"] = format_route_label(props.get("snowrouteid"))
         props["p_1h_pct"] = format_probability(props.get("p_1h"))
         props["p_2h_pct"] = format_probability(props.get("p_2h"))
         props["p_4h_pct"] = format_probability(props.get("p_4h"))
         props["p_8h_pct"] = format_probability(props.get("p_8h"))
+        props["p_bucket_1h_pct"] = format_probability(props.get("p_bucket_1h"))
+        props["p_bucket_2h_pct"] = format_probability(props.get("p_bucket_2h"))
+        props["p_bucket_4h_pct"] = format_probability(props.get("p_bucket_4h"))
+        props["p_bucket_8h_pct"] = format_probability(props.get("p_bucket_8h"))
+        props["p_ml_1h_pct"] = format_probability(props.get("p_ml_1h"))
+        props["p_ml_2h_pct"] = format_probability(props.get("p_ml_2h"))
+        props["p_ml_4h_pct"] = format_probability(props.get("p_ml_4h"))
+        props["p_ml_8h_pct"] = format_probability(props.get("p_ml_8h"))
+        props["bucket_priority_label"] = format_bucket_priority(props.get("bucket_priority_id"))
+        props["current_bucket_priority_label"] = format_bucket_priority(
+            props.get("current_bucket_priority")
+        )
+        props["eta_bucket_label"] = format_eta_hours(props.get("eta_bucket_hours"))
+        props["bucket_eta_tier"] = bucket_eta_tier(
+            props.get("eta_bucket_hours") or props.get("eta_hours_60")
+        )
         props["eta_60_label"] = format_eta_hours(props.get("eta_hours_60"))
         feat["properties"] = props
 
@@ -398,6 +471,50 @@ def format_route_label(value: float) -> str:
         return f"Route {int(value)}"
     except (TypeError, ValueError):
         return str(value)
+
+
+def format_bucket_priority(value: str | float | None) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    label = str(value)
+    if label.lower() in {"nan", "none", ""}:
+        return "N/A"
+    if label.startswith("P") and label[1:].isdigit():
+        return f"Priority {label[1:]}"
+    return label
+
+
+def bucket_eta_tier(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "Unknown"
+    hours = float(value)
+    if hours <= 1:
+        return "Now (≤1h)"
+    if hours <= 4:
+        return "Soon (1–4h)"
+    if hours <= 8:
+        return "Later today (4–8h)"
+    if hours <= 12:
+        return "Overnight (8–12h)"
+    if hours <= 24:
+        return "Next day (12–24h)"
+    return "Later (24h+)"
+
+
+def format_storm_start(start_ts: pd.Timestamp | None) -> str:
+    if start_ts is None or pd.isna(start_ts):
+        return "N/A"
+    return pd.to_datetime(start_ts).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def derive_bucket_priority_id(value: str | float | None) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value)
+    if text.startswith("P") and text[1:].isdigit():
+        return text
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return f"P{digits}" if digits else None
 
 
 # -----------------------------
@@ -437,7 +554,25 @@ with st.sidebar:
 
     st.divider()
     st.header("Predictions")
-    color_by = st.selectbox("Color predictions by", ["p_1h", "p_2h", "p_4h", "p_8h"], index=2)
+    color_by = st.selectbox(
+        "Color predictions by",
+        [
+            "p_1h",
+            "p_2h",
+            "p_4h",
+            "p_8h",
+            "p_bucket_1h",
+            "p_bucket_2h",
+            "p_bucket_4h",
+            "p_bucket_8h",
+            "p_ml_1h",
+            "p_ml_2h",
+            "p_ml_4h",
+            "p_ml_8h",
+            "bucket_eta_tier",
+        ],
+        index=2,
+    )
     min_prob = st.slider("Min probability (for table)", 0.0, 1.0, 0.0, 0.05)
 
 # Auto-refresh loop
@@ -465,7 +600,10 @@ with tab_live:
 
     predictions_df = load_latest_predictions(PREDICTIONS_PROB_PATH)
     if not predictions_df.empty:
-        df = df.merge(predictions_df, on="OBJECTID", how="left")
+        if "OBJECTID" in df.columns and "OBJECTID" in predictions_df.columns:
+            df = df.merge(predictions_df, on="OBJECTID", how="left")
+        elif "snowroutesegmentid" in df.columns and "snowroutesegmentid" in predictions_df.columns:
+            df = df.merge(predictions_df, on="snowroutesegmentid", how="left")
         for col in ["p_1h", "p_2h", "p_4h", "p_8h", "eta_hours_60"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -615,9 +753,28 @@ with tab_live:
     selected_display = st.multiselect("Show buckets:", options=options, default=options)
 
     selected_buckets = [b for b in BUCKET_ORDER if BUCKET_DISPLAY_LABELS[b] in selected_display]
+    if not selected_buckets:
+        selected_buckets = BUCKET_ORDER[:]
     map_df = df[df["bucket"].isin(selected_buckets)].copy()
 
-    for col in ["p_1h", "p_2h", "p_4h", "p_8h", "eta_hours_60"]:
+    for col in [
+        "p_1h",
+        "p_2h",
+        "p_4h",
+        "p_8h",
+        "p_bucket_1h",
+        "p_bucket_2h",
+        "p_bucket_4h",
+        "p_bucket_8h",
+        "p_ml_1h",
+        "p_ml_2h",
+        "p_ml_4h",
+        "p_ml_8h",
+        "eta_hours_60",
+        "eta_bucket_hours",
+        "current_bucket_priority",
+        "bucket_priority_id",
+    ]:
         if col not in map_df.columns:
             map_df[col] = pd.NA
 
@@ -629,7 +786,26 @@ with tab_live:
     map_df["p_2h_pct"] = map_df["p_2h"].apply(format_probability)
     map_df["p_4h_pct"] = map_df["p_4h"].apply(format_probability)
     map_df["p_8h_pct"] = map_df["p_8h"].apply(format_probability)
+    map_df["p_bucket_1h_pct"] = map_df["p_bucket_1h"].apply(format_probability)
+    map_df["p_bucket_2h_pct"] = map_df["p_bucket_2h"].apply(format_probability)
+    map_df["p_bucket_4h_pct"] = map_df["p_bucket_4h"].apply(format_probability)
+    map_df["p_bucket_8h_pct"] = map_df["p_bucket_8h"].apply(format_probability)
+    map_df["p_ml_1h_pct"] = map_df["p_ml_1h"].apply(format_probability)
+    map_df["p_ml_2h_pct"] = map_df["p_ml_2h"].apply(format_probability)
+    map_df["p_ml_4h_pct"] = map_df["p_ml_4h"].apply(format_probability)
+    map_df["p_ml_8h_pct"] = map_df["p_ml_8h"].apply(format_probability)
     map_df["eta_60_label"] = map_df["eta_hours_60"].apply(format_eta_hours)
+    map_df["eta_bucket_label"] = map_df["eta_bucket_hours"].apply(format_eta_hours)
+    map_df["bucket_priority_label"] = map_df["bucket_priority_id"].apply(format_bucket_priority)
+    map_df["current_bucket_priority_label"] = map_df["current_bucket_priority"].apply(
+        format_bucket_priority
+    )
+    map_df["bucket_eta_tier"] = map_df["eta_bucket_hours"].apply(bucket_eta_tier)
+
+    if "lastserviced_dt" in map_df.columns:
+        map_df["lastserviced_label"] = map_df["lastserviced_dt"].dt.strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        map_df["lastserviced_label"] = "N/A"
 
     map_df["color"] = map_df["bucket"].map(lambda b: BUCKET_COLORS.get(b, [0, 0, 0]))
 
@@ -669,7 +845,12 @@ with tab_live:
                     "Current status: {servicestatus}\n"
                     "Time-since-plow bucket: {bucket}\n"
                     "Segment length (miles): {miles:.3f}\n"
-                    "Last plowed at: {lastserviced_dt}\n"
+                    "Last plowed at: {lastserviced_label}\n"
+                    "Bucket (typical): {bucket_priority_label}\n"
+                    "Current plow bucket: {current_bucket_priority_label}\n"
+                    "Bucket ETA: {eta_bucket_label}\n"
+                    "Bucket chance ≤4h: {p_bucket_4h_pct}\n"
+                    "Model chance ≤4h: {p_ml_4h_pct}\n"
                 )
             },
         ),
@@ -827,6 +1008,60 @@ with tab_pred:
 
     st.caption("Color scale uses probabilities. Grey segments are untracked/no prediction.")
 
+    event_slice = preds[preds["eventid"] == selected_event].copy()
+    if "bucket_priority_id" not in event_slice.columns and "routepriority" in event_slice.columns:
+        event_slice["bucket_priority_id"] = event_slice["routepriority"].apply(derive_bucket_priority_id)
+    if "bucket_priority_id" not in view.columns and "routepriority" in view.columns:
+        view["bucket_priority_id"] = view["routepriority"].apply(derive_bucket_priority_id)
+
+    current_bucket = None
+    if "current_bucket_priority" in event_slice.columns:
+        bucket_mode = event_slice["current_bucket_priority"].dropna().mode()
+        current_bucket = bucket_mode.iloc[0] if not bucket_mode.empty else None
+    if current_bucket is None and "bucket_priority_id" in event_slice.columns:
+        likely_now = event_slice[event_slice.get("p_1h", 0).fillna(0) >= 0.6]
+        source = likely_now if not likely_now.empty else event_slice
+        bucket_mode = source["bucket_priority_id"].dropna().mode()
+        current_bucket = bucket_mode.iloc[0] if not bucket_mode.empty else None
+
+    typical_bucket = None
+    if "bucket_priority_id" in view.columns:
+        typical_mode = view["bucket_priority_id"].dropna().mode()
+        typical_bucket = typical_mode.iloc[0] if not typical_mode.empty else None
+
+    st.subheader("Bucket-based schedule estimate")
+    st.caption(BUCKET_EXPLAINER_TEXT)
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Current storm bucket", format_bucket_priority(current_bucket))
+    b2.metric("Typical bucket (filtered)", format_bucket_priority(typical_bucket))
+    eta_bucket_median = None
+    if "eta_bucket_hours" in view.columns and view["eta_bucket_hours"].notna().any():
+        eta_bucket_median = view["eta_bucket_hours"].median()
+    elif "eta_hours_60" in view.columns and view["eta_hours_60"].notna().any():
+        eta_bucket_median = view["eta_hours_60"].median()
+    b3.metric("Median bucket ETA", format_eta_hours(eta_bucket_median))
+
+    bucket_prob_median = None
+    if "p_bucket_4h" in view.columns and view["p_bucket_4h"].notna().any():
+        bucket_prob_median = view["p_bucket_4h"].median()
+    elif "p_4h" in view.columns and view["p_4h"].notna().any():
+        bucket_prob_median = view["p_4h"].median()
+    b4.metric("Bucket chance ≤4h", format_probability(bucket_prob_median))
+
+    storm_start = None
+    if "storm_operational_start" in event_slice.columns:
+        storm_start = event_slice["storm_operational_start"].dropna().max()
+    storm_start_label = format_storm_start(storm_start)
+    if storm_start is not None and not pd.isna(storm_start):
+        hours_into = (pd.Timestamp.now(tz="UTC") - pd.to_datetime(storm_start, utc=True)).total_seconds() / 3600
+        st.caption(f"Storm started: {storm_start_label} ({hours_into:.1f} hours ago).")
+    else:
+        st.caption("Storm start time is unavailable for this event.")
+
+    tier_value = bucket_eta_tier(eta_bucket_median)
+    st.caption(f"Typical service timing narrative: **{tier_value}** for this filtered set.")
+
     if not geojson_obj:
         st.warning(f"GeoJSON not found at {GEOJSON_PATH.name}. Add it to render the prediction map.")
     else:
@@ -848,11 +1083,17 @@ with tab_pred:
             <b>Road name:</b> {roadname}<br/>
             <b>Priority level:</b> {routepriority}<br/>
             <b>Route label:</b> {route_label}<br/>
+            <b>Typical bucket:</b> {bucket_priority_label}<br/>
+            <b>Current storm bucket:</b> {current_bucket_priority_label}<br/>
+            <b>Bucket ETA:</b> {eta_bucket_label}<br/>
             <b>Prediction status:</b> {prediction_status}<br/>
+            <b>Bucket ETA tier:</b> {bucket_eta_tier}<br/>
             <b>Chance of plow within 1 hour:</b> {p_1h_pct}<br/>
             <b>Chance of plow within 2 hours:</b> {p_2h_pct}<br/>
             <b>Chance of plow within 4 hours:</b> {p_4h_pct}<br/>
             <b>Chance of plow within 8 hours:</b> {p_8h_pct}<br/>
+            <b>Bucket chance ≤4 hours:</b> {p_bucket_4h_pct}<br/>
+            <b>Model-only chance ≤4 hours:</b> {p_ml_4h_pct}<br/>
             <b>Estimated time to plow (60% chance):</b> {eta_60_label}
             """,
             "style": {"backgroundColor": "white", "color": "black"},
@@ -880,6 +1121,18 @@ with tab_pred:
             "roadname",
             "routepriority",
             "snowrouteid",
+            "bucket_priority_id",
+            "current_bucket_priority",
+            "eta_bucket_hours",
+            "bucket_eta_tier",
+            "p_bucket_1h",
+            "p_bucket_2h",
+            "p_bucket_4h",
+            "p_bucket_8h",
+            "p_ml_1h",
+            "p_ml_2h",
+            "p_ml_4h",
+            "p_ml_8h",
             "p_1h",
             "p_2h",
             "p_4h",
