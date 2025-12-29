@@ -18,6 +18,8 @@ import requests
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.inspection import permutation_importance
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 import sklearn.metrics as sk_metrics
 from sklearn.metrics import (
     average_precision_score,
@@ -56,6 +58,51 @@ ALERT_LOG_PATH = str(ARTIFACT_DIR / "nws_alerts_log.csv")
 NOAA_STATION_ID = "KSYR"
 NWS_POINT = "43.0481,-76.1474"
 NWS_USER_AGENT = "snow_map_dashboard (https://github.com/samedelstein/snow_map_dashboard)"
+
+
+class _PrefitCalibrator:
+    def __init__(self, estimator: HistGradientBoostingClassifier, method: str) -> None:
+        self.estimator = estimator
+        self.method = method
+        self.calibrator: IsotonicRegression | LogisticRegression | None = None
+        self.classes_ = np.array([0, 1])
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "_PrefitCalibrator":
+        p = self.estimator.predict_proba(X)[:, 1]
+        if self.method == "isotonic":
+            self.calibrator = IsotonicRegression(out_of_bounds="clip")
+            self.calibrator.fit(p, y)
+        else:
+            self.calibrator = LogisticRegression(solver="lbfgs")
+            self.calibrator.fit(p.reshape(-1, 1), y)
+        return self
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        if self.calibrator is None:
+            raise ValueError("Calibrator has not been fitted.")
+        p = self.estimator.predict_proba(X)[:, 1]
+        if isinstance(self.calibrator, IsotonicRegression):
+            p_cal = self.calibrator.predict(p)
+        else:
+            p_cal = self.calibrator.predict_proba(p.reshape(-1, 1))[:, 1]
+        p_cal = np.clip(p_cal, 0.0, 1.0)
+        return np.column_stack([1 - p_cal, p_cal])
+
+
+def _fit_prefit_calibrator(
+    estimator: HistGradientBoostingClassifier,
+    X_calib: pd.DataFrame,
+    y_calib: pd.Series,
+    method: str,
+) -> CalibratedClassifierCV | _PrefitCalibrator:
+    try:
+        calibrator = CalibratedClassifierCV(estimator, cv="prefit", method=method)
+        calibrator.fit(X_calib, y_calib)
+        return calibrator
+    except ValueError:
+        calibrator = _PrefitCalibrator(estimator, method)
+        calibrator.fit(X_calib, y_calib)
+        return calibrator
 
 
 # -----------------------------
@@ -806,9 +853,7 @@ def train_models(
                 method = "isotonic"
             else:
                 method = "sigmoid"
-            calibrator = CalibratedClassifierCV(clf, cv="prefit", method=method)
-            calibrator.fit(X_calib, y_calib)
-            calibrated[h] = calibrator
+            calibrated[h] = _fit_prefit_calibrator(clf, X_calib, y_calib, method)
         else:
             calibrated[h] = None
 
