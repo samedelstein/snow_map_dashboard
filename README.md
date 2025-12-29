@@ -72,6 +72,11 @@ Generated files (all under `data/artifacts_snow/`):
 GitHub Actions workflows run the snapshot and prediction jobs on a schedule in
 `.github/workflows/snapshot.yml` and `.github/workflows/predict.yml`.
 
+## Static site export
+
+The static site loads live data client-side (real-time when available). If the live API is blocked,
+the UI falls back to the bundled static snapshot.
+
 ## Weather data sources
 
 The training pipeline (`snow_predict.py`) enriches each snapshot with hourly weather
