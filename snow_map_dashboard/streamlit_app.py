@@ -903,5 +903,5 @@ with st.expander("Raw live rows (sample)"):
         df_live[
             ["OBJECTID", "roadname", "bucket", "miles", "lastserviced_dt", "servicestatus", "passes"]
         ].head(500),
-        width="stretch",
+        use_container_width=True,
     )
