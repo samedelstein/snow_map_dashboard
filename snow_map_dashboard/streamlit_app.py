@@ -894,8 +894,9 @@ st.pydeck_chart(
             )
         },
     ),
-    width="stretch",
+    use_container_width=True,
 )
+
 
 with st.expander("Raw live rows (sample)"):
     st.dataframe(
