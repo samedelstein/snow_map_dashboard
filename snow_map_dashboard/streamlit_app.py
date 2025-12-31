@@ -762,9 +762,10 @@ else:
 
 with st.expander("Show hourly tables (debug)"):
     st.write("Hourly lane-miles:")
-    st.dataframe(hourly_work, width="stretch")
+    st.dataframe(hourly_work, use_container_width=True)
+
     st.write("Hourly new coverage miles:")
-    st.dataframe(hourly_cov_new, width="stretch")
+    st.dataframe(hourly_cov_new, use_container_width=True)
 
 # -----------------------------
 # Live API recency map (your existing style)
