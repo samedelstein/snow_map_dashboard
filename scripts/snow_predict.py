@@ -626,6 +626,9 @@ def persist_alert_log(
 
     if os.path.exists(path):
         existing = pd.read_csv(path)
+        for col in ("start_ts", "end_ts"):
+            if col in existing.columns:
+                existing[col] = pd.to_datetime(existing[col], utc=True, errors="coerce")
         combined = pd.concat([existing, log_df], ignore_index=True)
         combined = combined.drop_duplicates(subset=["alert_id"], keep="last")
         added = len(combined) - len(existing)
