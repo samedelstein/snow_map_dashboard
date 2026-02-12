@@ -52,6 +52,10 @@ Generated files (all under `data/snapshot_snow_routes/`):
 - `state.json`: a lightweight fingerprint store used to detect which features have changed since the
   last run.
 
+Snapshot retention: to keep the repo size manageable, `snapshots.csv` in the repo keeps rows from
+February 1, 2026 (UTC) onward. The full history and pre-Feb-2026 rows are stored in
+`data/snapshot_snow_routes/reduced/` (git-ignored), including `snapshots_pre_2026-02.csv`.
+
 ### Prediction pipeline
 
 The prediction pipeline is implemented in `scripts/snow_predict.py` and produces the latest model
